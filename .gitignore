@@ -1,0 +1,4 @@
+/venv/*
+/extracted
+/downloads
+/__pyacache__/*
