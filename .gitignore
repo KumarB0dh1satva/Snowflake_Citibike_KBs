@@ -2,3 +2,5 @@
 /extracted
 /downloads
 /__pycache__/*
+/gzip_staging/nyc/*
+/gzip_staging/jersey_city/*

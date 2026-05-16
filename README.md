@@ -25,6 +25,7 @@ pip install -r requirements.txt
 | `download_citibike_data.py` | Downloads zips, extracts them, logs to `download_log.jsonl` |
 | `analyze_extracted_schema.py` | Scans `extracted/` for CSV schemas and nested zips; writes `analysis_output/` |
 | `extract_nested_zips.py` | Extracts inner monthly zips for annual bundles (uses `analysis_output/analysis_summary.json`) |
+| `compress_for_snowflake.py` | Builds `.csv.gz` parts (100–250 MB) under `gzip_staging/nyc/` and `gzip_staging/jersey_city/` |
 
 ## Pipeline (run in order)
 
@@ -74,6 +75,20 @@ python extract_nested_zips.py
 
 **Output:** `nested_extract_log.jsonl`  
 Nested zips under `extracted/` are removed after a verified extract to save space; parent zips remain in `downloads/` for re-processing if needed.
+
+### 5. Compress for Snowflake staging
+
+```bash
+python compress_for_snowflake.py
+```
+
+**Outputs:**
+
+- `gzip_staging/nyc/{schema_key}/*.csv.gz` — NYC data (map to your NYC Snowflake schema)
+- `gzip_staging/jersey_city/{schema_key}/*.csv.gz` — Jersey City (`JC-*`) data
+- `gzip_staging/gzip_manifest.jsonl` — audit log of source files per gzip part
+
+Options: `--region nyc|jersey_city|all`, `--dry-run`, `--min-mb 100`, `--max-mb 250`
 
 ## What is not in this repo
 
