@@ -9,8 +9,8 @@ Python pipeline to discover, download, and extract Citi Bike trip data from the 
 - A Snowflake account with:
   - Database: `CITIBIKE_SYSTEM_DATA`
   - Schemas: `STAGING_NYC`, `STAGING_JC`
-  - Internal stages: `RAW_INGESTION` in each schema
-  - Target tables (e.g. `TRIPS_MODERN`, `TRIPS_LEGACY`) — must exist before `COPY INTO` runs
+  - Internal stages: `RAW_INGESTION` in each schema (already created in your account)
+  - Staging tables created from `Snowflake_Scripts/` (see below) **before** running the loader
 
 ## Setup
 
@@ -35,7 +35,7 @@ Alternatively, set environment variables (they override the credentials file):
 export SF_ACCOUNT="your_account_identifier"
 export SF_USER="your_username"
 export SF_PASSWORD="your_password"
-export SF_WAREHOUSE="your_warehouse"
+export SF_WAREHOUSE="LOADING_LOCAL"
 export SF_DATABASE="CITIBIKE_SYSTEM_DATA"
 export SF_ROLE="SYSADMIN"
 ```
@@ -55,6 +55,41 @@ Non-secret load settings (schema names, stage name, table mapping) live in `snow
 | `snowflake_config.py` | Region → schema, `schema_key` → table, stage name (no passwords) |
 | `snowflake_credentials.py` | Account, user, password, warehouse, database, role (**gitignored**) |
 | `snowflake_credentials.example.py` | Template for `snowflake_credentials.py` |
+| `Snowflake_Scripts/` | `CREATE TABLE` DDL for staging tables (NYC + JC) |
+
+### Snowflake DDL (`Snowflake_Scripts/`)
+
+Run these scripts in the Snowflake UI (or `snowsql`) **once per schema** before loading data. Each script uses `CREATE TABLE IF NOT EXISTS` against `CITIBIKE_SYSTEM_DATA`.
+
+| Path | Table | Source CSV layout |
+|------|-------|-------------------|
+| `STAGING_NYC/TRIPS_MODERN.sql` | `STAGING_NYC.TRIPS_MODERN` | schema_1 — 13 cols, `ride_id` (2020+) |
+| `STAGING_NYC/TRIPS_LEGACY_V1.sql` | `STAGING_NYC.TRIPS_LEGACY_V1` | schema_2 — 15 cols, lowercase (`tripduration`, …) |
+| `STAGING_NYC/TRIPS_LEGACY_V2.sql` | `STAGING_NYC.TRIPS_LEGACY_V2` | schema_3 — 15 cols, Title Case (`Trip Duration`, …) |
+| `STAGING_JC/TRIPS_MODERN.sql` | `STAGING_JC.TRIPS_MODERN` | Same as NYC modern |
+| `STAGING_JC/TRIPS_LEGACY_V1.sql` | `STAGING_JC.TRIPS_LEGACY_V1` | Same as NYC legacy v1 |
+| `STAGING_JC/TRIPS_LEGACY_V2.sql` | `STAGING_JC.TRIPS_LEGACY_V2` | Same as NYC legacy v2 |
+
+Every table includes three ingestion metadata columns (populated by defaults or a future loader enhancement):
+
+- `_SOURCE_FILE` — source `.csv.gz` name
+- `_SOURCE_ROW_NUMBER` — row index in file
+- `_LOADED_AT` — load timestamp (default `CURRENT_TIMESTAMP()`)
+
+Example (repeat for all six files):
+
+```sql
+-- In Snowflake worksheet: run contents of Snowflake_Scripts/STAGING_NYC/TRIPS_MODERN.sql
+```
+
+Verify tables exist:
+
+```sql
+SHOW TABLES IN SCHEMA CITIBIKE_SYSTEM_DATA.STAGING_NYC;
+SHOW TABLES IN SCHEMA CITIBIKE_SYSTEM_DATA.STAGING_JC;
+```
+
+You should see `TRIPS_MODERN`, `TRIPS_LEGACY_V1`, and `TRIPS_LEGACY_V2` in each schema.
 
 ## Pipeline (run in order)
 
@@ -121,11 +156,21 @@ Options: `--region nyc|jersey_city|all`, `--dry-run`, `--min-mb 100`, `--max-mb 
 
 ### 6. Load into Snowflake
 
-Ensure target tables exist in Snowflake, then:
+#### Pre-flight checklist
+
+| Step | Check |
+|------|--------|
+| 1 | `snowflake_credentials.py` exists and warehouse is running |
+| 2 | All six `Snowflake_Scripts/**/*.sql` files executed in Snowflake |
+| 3 | `gzip_staging/gzip_manifest.jsonl` exists and local `.csv.gz` files are present |
+| 4 | `python load_to_snowflake.py --dry-run` shows expected schema → table targets |
+
+#### Run the loader
 
 ```bash
-python load_to_snowflake.py --dry-run    # preview PUT/COPY targets without connecting
-python load_to_snowflake.py                # load all pending manifest files
+python load_to_snowflake.py --dry-run    # preview targets (no Snowflake calls)
+python load_to_snowflake.py --region jersey_city   # smaller test: 7 files
+python load_to_snowflake.py                # all pending manifest files (~59 parts)
 ```
 
 **Options:**
@@ -138,26 +183,41 @@ python load_to_snowflake.py                # load all pending manifest files
 | `--dry-run` | Print load plan only |
 | `--reset-failed` | Re-queue files that hit max retries |
 
-**Per file:** reads `gzip_manifest.jsonl` → uploads to `@CITIBIKE_SYSTEM_DATA.<schema>.RAW_INGESTION` → `COPY INTO` the mapped table → appends one JSON line to `snowflake_ingest_log.jsonl`.
+**Per file:** reads `gzip_manifest.jsonl` → `PUT` to `@CITIBIKE_SYSTEM_DATA.<schema>.RAW_INGESTION` → `COPY INTO` the mapped table → appends one JSON line to `snowflake_ingest_log.jsonl`.
 
-Successful files are skipped on later runs. Failed files retry up to 3 times (configurable in `snowflake_config.py`).
+Successful files are skipped on later runs. Failed files retry up to 3 times (`MAX_RETRIES` in `snowflake_config.py`).
 
-#### Snowflake routing
+Monitor progress:
+
+```bash
+tail -f snowflake_ingest_log.jsonl
+```
+
+#### Snowflake routing (`snowflake_config.py`)
 
 | Manifest `region` | Snowflake schema | Stage |
 |-------------------|------------------|-------|
 | `nyc` | `STAGING_NYC` | `RAW_INGESTION` |
 | `jersey_city` | `STAGING_JC` | `RAW_INGESTION` |
 
-`schema_key` in the manifest is an MD5 fingerprint of the CSV column layout (from `compress_for_snowflake.py`), **not** a Snowflake schema name. It is mapped to table names in `snowflake_config.py`:
+`schema_key` is an MD5 fingerprint of the CSV column layout (from `compress_for_snowflake.py`), **not** a Snowflake schema name:
 
-| `schema_key` | Table | Layout |
-|--------------|-------|--------|
-| `dc497b4333c4` | `TRIPS_MODERN` | 13 columns (`ride_id`, `started_at`, …) |
-| `473144999085` | `TRIPS_LEGACY` | 15 columns, lowercase legacy headers |
-| `e24ee8457e0e` | `TRIPS_LEGACY` | 15 columns, Title Case legacy headers |
+| `schema_key` | Target table | CSV layout (`analysis_output/schema_signatures.csv`) |
+|--------------|--------------|------------------------------------------------------|
+| `dc497b4333c4` | `TRIPS_MODERN` | schema_1 — 13 columns, `ride_id`, … |
+| `473144999085` | `TRIPS_LEGACY_V1` | schema_2 — 15 columns, lowercase (`tripduration`, …) |
+| `e24ee8457e0e` | `TRIPS_LEGACY_V2` | schema_3 — 15 columns, Title Case (`Trip Duration`, …) |
 
-Adjust `SCHEMA_MAP` and `SCHEMA_KEY_TO_TABLE` in `snowflake_config.py` if your Snowflake object names differ.
+The same mapping applies in both `STAGING_NYC` and `STAGING_JC`; only the schema prefix changes.
+
+#### COPY behavior note
+
+`load_to_snowflake.py` runs a standard `COPY INTO <table> FROM @stage` with `SKIP_HEADER = 1`. Snowflake matches CSV columns to table columns **by position** unless you extend the loader. Your DDL tables have **18 / 16 / 16** columns (data + 3 metadata columns). If loads fail with column-count or header errors, either:
+
+- load only into the data columns via an explicit column list + `MATCH_BY_COLUMN_NAME`, or  
+- temporarily use tables without the `_SOURCE_*` columns for the first test.
+
+Start with `--region jersey_city` and one manifest part to validate before the full NYC run.
 
 ## What is not in this repo
 
@@ -170,11 +230,11 @@ Large and generated paths are gitignored (see `.gitignore`):
 - `__pycache__/`
 - `snowflake_credentials.py` (passwords)
 
-Clone the repo, configure Snowflake credentials locally, and run the scripts to reproduce data.
+Clone the repo, configure Snowflake credentials locally, run the DDL scripts, and run the Python pipeline to reproduce data.
 
 ## Schema notes
 
-Citibike files use several column layouts over the years (e.g. pre-2020 vs modern `ride_id` format). Use `analysis_output/schema_signatures.csv` when designing Snowflake `CREATE TABLE` DDL. The loader does **not** create tables; it only `COPY INTO` existing tables whose columns match the staged CSVs.
+Citibike files use several column layouts over the years. Use `analysis_output/schema_signatures.csv` alongside `Snowflake_Scripts/` when adjusting tables or `SCHEMA_KEY_TO_TABLE` in `snowflake_config.py`.
 
 ## License / data
 

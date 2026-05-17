@@ -155,36 +155,113 @@ def put_file(cur, local_path: Path, sf_schema: str) -> dict:
     return {"put_status": status, "put_rows": len(rows)}
 
 
-def copy_into(cur, local_filename: str, sf_schema: str, table: str) -> dict:
+def copy_into(cur, local_filename: str, sf_schema: str, table: str, force: bool = False) -> dict:
     """
     COPY the staged file into the target table.
-    Returns row counts from the COPY result.
+
+    Uses a SELECT subquery so that METADATA$FILENAME and
+    METADATA$FILE_ROW_NUMBER can be injected as _SOURCE_FILE and
+    _SOURCE_ROW_NUMBER.  The data columns are addressed positionally
+    ($1, $2, ...) which is robust to CSV column-name casing differences.
+
+    Column counts per table (data columns only, excluding the 3 metadata
+    columns _SOURCE_FILE, _SOURCE_ROW_NUMBER, _LOADED_AT):
+        TRIPS_LEGACY_V1  → 15 data columns  ($1 .. $15)
+        TRIPS_LEGACY_V2  → 15 data columns  ($1 .. $15)
+        TRIPS_MODERN     → 13 data columns  ($1 .. $13)
     """
-    stage_path = f"@{cfg.stage_fqn(sf_schema)}/{local_filename}"
+    stage_path      = f"@{cfg.stage_fqn(sf_schema)}/{local_filename}"
     qualified_table = f"{cfg.DATABASE}.{sf_schema}.{table}"
+
+    # Build the positional column projection for each table type.
+    # _LOADED_AT is omitted from the column list so its DEFAULT fires.
+    TABLE_DATA_COLS = {
+        "TRIPS_LEGACY_V1": (
+            # 15 data columns
+            "tripduration, starttime, stoptime, "
+            "start_station_id, start_station_name, "
+            "start_station_latitude, start_station_longitude, "
+            "end_station_id, end_station_name, "
+            "end_station_latitude, end_station_longitude, "
+            "bikeid, usertype, birth_year, gender"
+        ),
+        "TRIPS_LEGACY_V2": (
+            # 15 data columns (Title Case source, snake_case target)
+            "trip_duration, start_time, stop_time, "
+            "start_station_id, start_station_name, "
+            "start_station_latitude, start_station_longitude, "
+            "end_station_id, end_station_name, "
+            "end_station_latitude, end_station_longitude, "
+            "bike_id, user_type, birth_year, gender"
+        ),
+        "TRIPS_MODERN": (
+            # 13 data columns
+            "ride_id, rideable_type, started_at, ended_at, "
+            "start_station_name, start_station_id, "
+            "end_station_name, end_station_id, "
+            "start_lat, start_lng, end_lat, end_lng, "
+            "member_casual"
+        ),
+    }
+
+    data_col_names = TABLE_DATA_COLS.get(table)
+    if data_col_names is None:
+        raise ValueError(
+            f"No column mapping defined for table '{table}'. "
+            f"Add it to TABLE_DATA_COLS in copy_into()."
+        )
+
+    # Count data columns to build $1..$N projection
+    n_data_cols = len(data_col_names.split(","))
+    positional   = ", ".join(f"${i}" for i in range(1, n_data_cols + 1))
+
+    # Full target column list: data cols + two metadata cols
+    # (_LOADED_AT is excluded → DEFAULT CURRENT_TIMESTAMP() fires automatically)
+    target_cols = f"{data_col_names}, _source_file, _source_row_number"
+
     sql = f"""
-        COPY INTO {qualified_table}
-        FROM {stage_path}
+        COPY INTO {qualified_table} (
+            {target_cols}
+        )
+        FROM (
+            SELECT
+                {positional},
+                METADATA$FILENAME,
+                METADATA$FILE_ROW_NUMBER
+            FROM {stage_path}
+        )
         FILE_FORMAT = (
-            TYPE            = CSV
-            COMPRESSION     = GZIP
-            SKIP_HEADER     = 1
+            TYPE                         = CSV
+            COMPRESSION                  = GZIP
+            SKIP_HEADER                  = 1
             FIELD_OPTIONALLY_ENCLOSED_BY = '"'
-            NULL_IF         = ('', 'NULL', 'null')
-            EMPTY_FIELD_AS_NULL = TRUE
-            DATE_FORMAT     = AUTO
-            TIMESTAMP_FORMAT = AUTO
+            NULL_IF                      = ('', 'NULL', 'null')
+            EMPTY_FIELD_AS_NULL          = TRUE
+            DATE_FORMAT                  = AUTO
+            TIMESTAMP_FORMAT             = AUTO
         )
         ON_ERROR = 'CONTINUE'
         PURGE    = FALSE
+        FORCE    = {str(force).upper()}
     """
     cur.execute(sql)
     rows = cur.fetchall()
 
     # COPY result columns: file, status, rows_loaded, errors_seen, …
-    rows_loaded  = sum(int(r[3]) for r in rows if r[3] is not None)
-    errors_seen  = sum(int(r[4]) for r in rows if r[4] is not None)
+    rows_loaded   = sum(int(r[3]) for r in rows if r[3] is not None)
+    errors_seen   = sum(int(r[4]) for r in rows if r[4] is not None)
     copy_statuses = list({r[1] for r in rows})
+
+    # Snowflake returns LOAD_SKIPPED when it has already seen this file
+    # in its load history and FORCE = FALSE.  Treat this as an error so
+    # the caller knows rows were NOT actually loaded.
+    if any(s == "LOAD_SKIPPED" for s in copy_statuses):
+        raise RuntimeError(
+            "COPY returned LOAD_SKIPPED — Snowflake has already loaded this "
+            "file. The table likely has 0 rows from the previous failed run. "
+            "Re-run with --force to bypass Snowflake load history, then "
+            "TRUNCATE the target table first to avoid duplicate rows."
+        )
 
     return {
         "copy_rows_loaded": rows_loaded,
@@ -202,6 +279,7 @@ def load_one(
     log_index: dict,
     dry_run: bool,
     conn: snowflake.connector.SnowflakeConnection | None = None,
+    force: bool = False,
 ) -> dict:
     """
     Attempt to PUT + COPY a single manifest record.
@@ -263,6 +341,7 @@ def load_one(
         print(
             f"  [dry-run] {output_file}  →  "
             f"@{entry['sf_stage']}  →  {cfg.DATABASE}.{sf_schema}.{table}"
+            + ("  [FORCE]" if force else "")
         )
         return entry
 
@@ -273,7 +352,7 @@ def load_one(
     try:
         with conn.cursor() as cur:
             put_result = put_file(cur, local_path, sf_schema)
-            copy_result = copy_into(cur, local_path.name, sf_schema, table)
+            copy_result = copy_into(cur, local_path.name, sf_schema, table, force=force)
 
         entry.update(put_result)
         entry.update(copy_result)
@@ -305,13 +384,14 @@ def load_with_retry(
     log_index: dict,
     dry_run: bool,
     conn: snowflake.connector.SnowflakeConnection | None = None,
+    force: bool = False,
 ) -> dict:
     """
     Run load_one up to MAX_RETRIES times for a single record.
     Sleeps RETRY_DELAY_SECONDS between attempts on failure.
     """
     for attempt in range(1, cfg.MAX_RETRIES + 1):
-        entry = load_one(rec, log_index, dry_run, conn=conn)
+        entry = load_one(rec, log_index, dry_run, conn=conn, force=force)
         if entry["status"] in ("SUCCESS", "DRY_RUN"):
             return entry
         if attempt < cfg.MAX_RETRIES:
@@ -413,6 +493,15 @@ def parse_args():
         action="store_true",
         help="Re-queue files that previously exceeded MAX_RETRIES.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Pass FORCE=TRUE to Snowflake COPY, bypassing load history. "
+            "Use when a previous run loaded 0 rows due to a bad COPY. "
+            "Always TRUNCATE the target tables in Snowflake first to avoid duplicates."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -436,9 +525,11 @@ def main():
 
     if not args.dry_run:
         cfg.validate_config()
+        force_note = "  *** FORCE=TRUE — load history bypassed ***" if args.force else ""
         print(
             f"Snowflake target: {cfg.DATABASE}  "
             f"(warehouse={cfg.WAREHOUSE}, role={cfg.ROLE})\n"
+            f"{force_note}"
         )
 
     # ── process ─────────────────────────────────────
@@ -448,7 +539,12 @@ def main():
         conn = get_connection()
     try:
         for rec in tqdm(queue, desc="Loading to Snowflake", unit="file"):
-            entry = load_with_retry(rec, log_index, dry_run=args.dry_run, conn=conn)
+            entry = load_with_retry(
+                rec, log_index,
+                dry_run=args.dry_run,
+                conn=conn,
+                force=args.force,
+            )
             results.append(entry)
     finally:
         if conn is not None:

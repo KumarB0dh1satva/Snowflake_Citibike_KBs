@@ -38,8 +38,8 @@ SCHEMA_MAP = {
 # schema_key (MD5 of column layout) → target table in that region's schema
 SCHEMA_KEY_TO_TABLE = {
     "dc497b4333c4": "TRIPS_MODERN",   # 13-col ride_id layout (NYC + JC)
-    "473144999085": "TRIPS_LEGACY",   # 15-col lowercase legacy
-    "e24ee8457e0e": "TRIPS_LEGACY",   # 15-col Title Case legacy (2016-style)
+    "473144999085": "TRIPS_LEGACY_V1",   # 15-col lowercase legacy
+    "e24ee8457e0e": "TRIPS_LEGACY_V2",   # 15-col Title Case legacy (2016-style)
 }
 
 STAGE_NAME = "RAW_INGESTION"
