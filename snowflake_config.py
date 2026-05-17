@@ -46,7 +46,9 @@ STAGE_NAME = "RAW_INGESTION"
 
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 30
-PARALLEL_PUT_THREADS = 4
+PARALLEL_PUT_THREADS = 4       # Snowflake PUT command threads (per file)
+PARALLEL_STAGE_WORKERS = 4     # concurrent files in stage_files.py
+STAGE_PUT_OVERWRITE = True     # default OVERWRITE on PUT (avoid silent SKIPPED)
 
 
 def stage_fqn(schema: str) -> str:

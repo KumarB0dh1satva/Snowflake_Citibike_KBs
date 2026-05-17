@@ -10,8 +10,7 @@ Python pipeline to discover, download, and extract Citi Bike trip data from the 
   - Database: `CITIBIKE_SYSTEM_DATA`
   - Schemas: `STAGING_NYC`, `STAGING_JC`
   - Internal stages: `RAW_INGESTION` in each schema
-  - Staging tables from `Snowflake_Scripts/` (before loading)
-  - Stored procedure `LOGGING.SP_INGEST_STAGED_FILES` (if using the split staging path)
+  - Staging tables from `Snowflake_Scripts/` (only if using `load_to_snowflake.py`)
 
 ## Setup
 
@@ -45,30 +44,26 @@ Non-secret settings (schema names, stage name, table mapping, retries) live in `
 
 ## Snowflake ingest architecture
 
-After compression (step 5), you can load data in one of two ways:
+After compression (step 5), pick **one** Python loader:
 
 ```text
   gzip_staging/*.csv.gz
            │
-           ├─► [Recommended] stage_files.py
-           │         PUT → @STAGING_NYC|JC.RAW_INGESTION
-           │         log: snowflake_stage_log.jsonl
-           │              │
-           │              ▼
-           │         CALL LOGGING.SP_INGEST_STAGED_FILES(...)
-           │         (COPY INTO tables in Snowflake)
+           ├─► stage_files.py  (alternative: stage only)
+           │         parallel PUT → @STAGING_NYC|JC.RAW_INGESTION
+           │         log: snowflake_stage_loading_log.jsonl
            │
-           └─► [Alternative] load_to_snowflake.py
-                     PUT + COPY INTO from Python
+           └─► load_to_snowflake.py  (alternative: stage + tables)
+                     PUT + COPY INTO staging tables
                      log: snowflake_ingest_log.jsonl
 ```
 
-| Approach | Python script | Snowflake step | Log file |
-|----------|---------------|----------------|----------|
-| **Split (recommended)** | `stage_files.py` — upload only | `CALL CITIBIKE_SYSTEM_DATA.LOGGING.SP_INGEST_STAGED_FILES('all');` | `snowflake_stage_log.jsonl` |
-| **All-in-one** | `load_to_snowflake.py` — PUT + COPY | None (COPY runs in Python) | `snowflake_ingest_log.jsonl` |
+| Script | What it does | Log file | Tables required? |
+|--------|----------------|----------|------------------|
+| `stage_files.py` | Upload `.csv.gz` to `RAW_INGESTION` only (parallel) | `snowflake_stage_loading_log.jsonl` | No |
+| `load_to_snowflake.py` | `PUT` + `COPY INTO` `TRIPS_*` tables | `snowflake_ingest_log.jsonl` | Yes (run `Snowflake_Scripts/` DDL first) |
 
-Both paths read `gzip_staging/gzip_manifest.jsonl`, use the same credentials and `snowflake_config.py` routing, and target the same stages and tables.
+Both read `gzip_staging/gzip_manifest.jsonl`, use `snowflake_credentials.py` / `snowflake_config.py`, and target the same internal stages. `stage_files.py` does not run `COPY INTO` or reference downstream Snowflake jobs.
 
 ## Project structure
 
@@ -79,8 +74,8 @@ Both paths read `gzip_staging/gzip_manifest.jsonl`, use the same credentials and
 | `analyze_extracted_schema.py` | Scans `extracted/` for CSV schemas and nested zips; writes `analysis_output/` |
 | `extract_nested_zips.py` | Extracts inner monthly zips for annual bundles |
 | `compress_for_snowflake.py` | Builds `.csv.gz` parts (100–250 MB) under `gzip_staging/` |
-| `stage_files.py` | **PUT** gzip parts onto `RAW_INGESTION` (no COPY); logs to `snowflake_stage_log.jsonl` |
-| `load_to_snowflake.py` | **PUT + COPY INTO** from Python (alternative to stage + stored procedure) |
+| `stage_files.py` | Parallel **PUT** to `RAW_INGESTION` only; logs to `snowflake_stage_loading_log.jsonl` |
+| `load_to_snowflake.py` | **PUT + COPY INTO** staging tables from Python |
 | `snowflake_config.py` | Region → schema, `schema_key` → table, stage name (no passwords) |
 | `snowflake_credentials.py` | Account, user, password, warehouse, database, role (**gitignored**) |
 | `snowflake_credentials.example.py` | Template for `snowflake_credentials.py` |
@@ -169,9 +164,9 @@ python compress_for_snowflake.py
 
 Options: `--region nyc|jersey_city|all`, `--dry-run`, `--min-mb 100`, `--max-mb 250`
 
-### 6a. Stage files (PUT only) — recommended
+### 6a. Load to stage only (`stage_files.py`)
 
-Uploads local `.csv.gz` files to the internal stage. Does **not** run `COPY INTO` or write to tables.
+Uploads local `.csv.gz` files to `RAW_INGESTION` in parallel. No `COPY INTO`, no table writes, no downstream steps in this script.
 
 #### Pre-flight
 
@@ -180,45 +175,44 @@ Uploads local `.csv.gz` files to the internal stage. Does **not** run `COPY INTO
 | `snowflake_credentials.py` configured | |
 | `RAW_INGESTION` stages exist in `STAGING_NYC` and `STAGING_JC` | |
 | `gzip_manifest.jsonl` and local `.csv.gz` files present | |
-| Staging tables created (DDL scripts) | |
 
 ```bash
 python stage_files.py --dry-run              # preview PUT targets
 python stage_files.py --region jersey_city   # 7 files — good first test
+python stage_files.py --workers 4            # parallel uploads (default from snowflake_config.py)
 python stage_files.py                        # all pending (~59 parts)
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--region nyc` / `jersey_city` / `all` | Limit by region |
+| `--workers N` | Concurrent file uploads (default: `PARALLEL_STAGE_WORKERS` in config) |
 | `--dry-run` | Print plan only |
 | `--reset-failed` | Re-queue after max retries |
 | `--force` | Re-upload with `OVERWRITE=TRUE` |
+| `--no-overwrite` | Use `OVERWRITE=FALSE` (PUT may return `SKIPPED` if file already on stage) |
+| `--list-stage` | Print files currently on each `RAW_INGESTION` stage |
 
-**Log:** `snowflake_stage_log.jsonl` — one JSON line per attempt (`STAGED`, `FAILED`, `DRY_RUN`). Files with `STAGED` are skipped on re-run unless `--force`.
+Default PUT uses `OVERWRITE=TRUE` (`STAGE_PUT_OVERWRITE` in `snowflake_config.py`). After each PUT, the script runs `LIST` on the stage to verify the file is present.
+
+**Log:** `snowflake_stage_loading_log.jsonl` — `SUCCESS` with `put_status` `UPLOADED` (new bytes sent) or `SKIPPED` (already on stage, verified). Console shows `ON_STAGE` for the latter — not a failure. Files with verified `SUCCESS` are skipped on re-run unless `--force`.
 
 ```bash
-tail -f snowflake_stage_log.jsonl
+python stage_files.py --list-stage   # confirm what Snowflake has
 ```
 
-### 6b. Ingest staged files (Snowflake)
-
-After `stage_files.py` completes, run the stored procedure in Snowflake to `COPY INTO` the correct tables:
-
-```sql
--- All regions
-CALL CITIBIKE_SYSTEM_DATA.LOGGING.SP_INGEST_STAGED_FILES('all');
-
--- Or per region
-CALL CITIBIKE_SYSTEM_DATA.LOGGING.SP_INGEST_STAGED_FILES('nyc');
-CALL CITIBIKE_SYSTEM_DATA.LOGGING.SP_INGEST_STAGED_FILES('jersey_city');
+```bash
+tail -f snowflake_stage_loading_log.jsonl
 ```
 
-The procedure uses `schema_key` / region routing aligned with `snowflake_config.py` to pick the target table (`TRIPS_MODERN`, `TRIPS_LEGACY_V1`, `TRIPS_LEGACY_V2`).
+Tune parallelism in `snowflake_config.py`:
 
-### 6 (alternative). Load from Python (PUT + COPY)
+- `PARALLEL_STAGE_WORKERS` — how many files upload at once (`--workers`)
+- `PARALLEL_PUT_THREADS` — Snowflake `PUT` threads per file
 
-Single script that uploads and copies in one pass (no stored procedure):
+### 6b. Load to stage + tables (`load_to_snowflake.py`)
+
+Uploads and `COPY INTO` staging tables in one Python run:
 
 ```bash
 python load_to_snowflake.py --dry-run
@@ -228,7 +222,7 @@ python load_to_snowflake.py
 
 **Log:** `snowflake_ingest_log.jsonl`
 
-Use this path if you prefer not to deploy `SP_INGEST_STAGED_FILES`, or for debugging COPY issues from Python.
+Requires staging tables from `Snowflake_Scripts/` before running.
 
 ## What is not in this repo
 
@@ -239,7 +233,7 @@ See `.gitignore`:
 - `venv/`, `__pycache__/`
 - `snowflake_credentials.py`
 
-Generated logs (`snowflake_stage_log.jsonl`, `snowflake_ingest_log.jsonl`) may exist locally; they are runtime artifacts.
+Generated logs (`snowflake_stage_loading_log.jsonl`, `snowflake_ingest_log.jsonl`) may exist locally; they are runtime artifacts.
 
 ## Schema notes
 
