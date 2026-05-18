@@ -1,0 +1,500 @@
+-- =============================================================
+-- SP_INGEST_STAGED_FILES.sql
+-- Database : CITIBIKE_SYSTEM_DATA
+-- Schema   : LOGGING
+--
+-- What this does
+-- ──────────────
+-- 1. Reads LOGGING.STAGE_MANIFEST to find files that are on the
+--    Snowflake stage but not yet successfully COPYed into their
+--    target table.
+-- 2. Runs COPY INTO for each pending file using a SELECT subquery
+--    so METADATA$FILENAME and METADATA$FILE_ROW_NUMBER populate
+--    the _SOURCE_FILE and _SOURCE_ROW_NUMBER columns.
+-- 3. Writes a detailed result row to LOGGING.INGEST_LOG after
+--    every single file — success or failure — so you can query
+--    status at any time without waiting for the run to finish.
+-- 4. Returns a summary VARCHAR so you can see counts in a
+--    CALL result or Task history.
+--
+-- Prerequisites (run once before deploying this SP)
+-- ──────────────────────────────────────────────────
+--   Step 1 : Create LOGGING schema and its two tables (Section 1)
+--   Step 2 : Load the stage manifest from your Python output (Section 2)
+--   Step 3 : Create the stored procedure (Section 3)
+--
+-- Calling the procedure
+-- ──────────────────────
+--   CALL CITIBIKE_SYSTEM_DATA.LOGGING.SP_INGEST_STAGED_FILES('all');
+--   CALL CITIBIKE_SYSTEM_DATA.LOGGING.SP_INGEST_STAGED_FILES('nyc');
+--   CALL CITIBIKE_SYSTEM_DATA.LOGGING.SP_INGEST_STAGED_FILES('jersey_city');
+--
+-- Monitoring
+-- ──────────
+--   SELECT * FROM CITIBIKE_SYSTEM_DATA.LOGGING.INGEST_LOG
+--   ORDER BY started_at_utc DESC;
+--
+--   -- Files still pending (staged but not yet COPYed successfully)
+--   SELECT * FROM CITIBIKE_SYSTEM_DATA.LOGGING.V_PENDING_FILES;
+--
+--   -- Row count cross-check per table
+--   SELECT * FROM CITIBIKE_SYSTEM_DATA.LOGGING.V_TABLE_ROW_COUNTS;
+-- =============================================================
+
+
+USE DATABASE CITIBIKE_SYSTEM_DATA;
+
+
+-- =============================================================
+-- SECTION 1 — LOGGING SCHEMA + TABLES
+-- =============================================================
+
+CREATE SCHEMA IF NOT EXISTS CITIBIKE_SYSTEM_DATA.LOGGING;
+
+USE SCHEMA LOGGING;
+
+-- -----------------------------------------------------------
+-- STAGE_MANIFEST
+-- Populated once from your gzip_manifest.jsonl (see Section 2).
+-- The SP reads this as its work queue.
+-- -----------------------------------------------------------
+CREATE TABLE IF NOT EXISTS CITIBIKE_SYSTEM_DATA.LOGGING.STAGE_MANIFEST (
+    OUTPUT_FILE         VARCHAR(500)  NOT NULL  COMMENT 'Relative path under gzip_staging/ e.g. nyc/abc123/nyc_abc123_part0001.csv.gz',
+    REGION              VARCHAR(50)             COMMENT 'nyc or jersey_city',
+    SCHEMA_KEY          VARCHAR(50)             COMMENT 'MD5 schema fingerprint from compress_for_snowflake.py',
+    SF_SCHEMA           VARCHAR(100)            COMMENT 'Target Snowflake schema e.g. STAGING_NYC',
+    SF_TABLE            VARCHAR(100)            COMMENT 'Target table e.g. TRIPS_MODERN',
+    GZIP_SIZE_BYTES     NUMBER                  COMMENT 'Compressed file size in bytes',
+    SOURCE_FILE_COUNT   NUMBER                  COMMENT 'Number of source CSVs packed into this gz',
+    CREATED_AT          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Prevent duplicate manifest rows
+ALTER TABLE CITIBIKE_SYSTEM_DATA.LOGGING.STAGE_MANIFEST
+    ADD CONSTRAINT IF NOT EXISTS UQ_STAGE_MANIFEST_FILE
+    UNIQUE (OUTPUT_FILE);
+
+-- -----------------------------------------------------------
+-- INGEST_LOG
+-- One row per COPY attempt per file.
+-- All attempts are kept — latest status per file is the view of record.
+-- -----------------------------------------------------------
+CREATE TABLE IF NOT EXISTS CITIBIKE_SYSTEM_DATA.LOGGING.INGEST_LOG (
+    LOG_ID              NUMBER        AUTOINCREMENT PRIMARY KEY,
+    OUTPUT_FILE         VARCHAR(500)  NOT NULL  COMMENT 'Matches STAGE_MANIFEST.OUTPUT_FILE',
+    REGION              VARCHAR(50)             COMMENT 'nyc or jersey_city',
+    SCHEMA_KEY          VARCHAR(50),
+    SF_SCHEMA           VARCHAR(100),
+    SF_TABLE            VARCHAR(100),
+    GZIP_SIZE_MB        FLOAT,
+    ATTEMPT             INT           DEFAULT 1 COMMENT 'Attempt number for this file (1-based)',
+    TRIGGERED_BY        VARCHAR(100)            COMMENT 'SP_INGEST_STAGED_FILES | manual | airflow | task',
+    STARTED_AT_UTC      TIMESTAMP_NTZ,
+    ENDED_AT_UTC        TIMESTAMP_NTZ,
+    STATUS              VARCHAR(20)             COMMENT 'SUCCESS | FAILED | SKIPPED',
+    ROWS_LOADED         NUMBER,
+    ERRORS_SEEN         NUMBER,
+    COPY_STATUS_RAW     VARCHAR(500)            COMMENT 'Raw status string(s) from COPY result',
+    ERROR_MESSAGE       VARCHAR(4000),
+    CREATED_AT          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- -----------------------------------------------------------
+-- V_LATEST_INGEST_STATUS
+-- One row per file — the most recent attempt only.
+-- Use this to see what is done, pending, or failed.
+-- -----------------------------------------------------------
+CREATE OR REPLACE VIEW CITIBIKE_SYSTEM_DATA.LOGGING.V_LATEST_INGEST_STATUS AS
+SELECT
+    il.*
+FROM CITIBIKE_SYSTEM_DATA.LOGGING.INGEST_LOG il
+INNER JOIN (
+    SELECT OUTPUT_FILE, MAX(LOG_ID) AS MAX_LOG_ID
+    FROM   CITIBIKE_SYSTEM_DATA.LOGGING.INGEST_LOG
+    GROUP BY OUTPUT_FILE
+) latest ON il.LOG_ID = latest.MAX_LOG_ID;
+
+-- -----------------------------------------------------------
+-- V_PENDING_FILES
+-- Files that are in the manifest but not yet successfully loaded.
+-- Run this before or after the SP to see what is still outstanding.
+-- -----------------------------------------------------------
+CREATE OR REPLACE VIEW CITIBIKE_SYSTEM_DATA.LOGGING.V_PENDING_FILES AS
+SELECT
+    m.OUTPUT_FILE,
+    m.REGION,
+    m.SF_SCHEMA,
+    m.SF_TABLE,
+    m.GZIP_SIZE_BYTES,
+    s.STATUS          AS LAST_STATUS,
+    s.ATTEMPT         AS LAST_ATTEMPT,
+    s.ERROR_MESSAGE   AS LAST_ERROR,
+    s.ENDED_AT_UTC    AS LAST_ATTEMPT_AT
+FROM CITIBIKE_SYSTEM_DATA.LOGGING.STAGE_MANIFEST m
+LEFT JOIN CITIBIKE_SYSTEM_DATA.LOGGING.V_LATEST_INGEST_STATUS s
+       ON s.OUTPUT_FILE = m.OUTPUT_FILE
+WHERE COALESCE(s.STATUS, 'PENDING') != 'SUCCESS'
+ORDER BY m.REGION, m.SF_TABLE, m.OUTPUT_FILE;
+
+-- -----------------------------------------------------------
+-- V_TABLE_ROW_COUNTS
+-- Cross-check: rows loaded according to the log vs actual table counts.
+-- Discrepancy means a file was counted as SUCCESS but data is missing.
+-- -----------------------------------------------------------
+CREATE OR REPLACE VIEW CITIBIKE_SYSTEM_DATA.LOGGING.V_TABLE_ROW_COUNTS AS
+WITH log_counts AS (
+    SELECT
+        SF_SCHEMA,
+        SF_TABLE,
+        SUM(ROWS_LOADED) AS LOG_ROWS_LOADED,
+        COUNT(*)         AS FILES_LOADED
+    FROM CITIBIKE_SYSTEM_DATA.LOGGING.INGEST_LOG
+    WHERE STATUS = 'SUCCESS'
+    GROUP BY SF_SCHEMA, SF_TABLE
+)
+SELECT
+    lc.SF_SCHEMA,
+    lc.SF_TABLE,
+    lc.LOG_ROWS_LOADED,
+    lc.FILES_LOADED,
+    -- Actual table counts (union all six tables, filter by schema+table name)
+    t.ACTUAL_ROW_COUNT,
+    (lc.LOG_ROWS_LOADED - t.ACTUAL_ROW_COUNT) AS DISCREPANCY
+FROM log_counts lc
+JOIN (
+    -- STAGING_NYC
+    SELECT 'STAGING_NYC' AS SF_SCHEMA, 'TRIPS_LEGACY_V1' AS SF_TABLE, COUNT(*) AS ACTUAL_ROW_COUNT FROM CITIBIKE_SYSTEM_DATA.STAGING_NYC.TRIPS_LEGACY_V1
+    UNION ALL
+    SELECT 'STAGING_NYC', 'TRIPS_LEGACY_V2', COUNT(*) FROM CITIBIKE_SYSTEM_DATA.STAGING_NYC.TRIPS_LEGACY_V2
+    UNION ALL
+    SELECT 'STAGING_NYC', 'TRIPS_MODERN',    COUNT(*) FROM CITIBIKE_SYSTEM_DATA.STAGING_NYC.TRIPS_MODERN
+    -- STAGING_JC
+    UNION ALL
+    SELECT 'STAGING_JC', 'TRIPS_LEGACY_V1', COUNT(*) FROM CITIBIKE_SYSTEM_DATA.STAGING_JC.TRIPS_LEGACY_V1
+    UNION ALL
+    SELECT 'STAGING_JC', 'TRIPS_LEGACY_V2', COUNT(*) FROM CITIBIKE_SYSTEM_DATA.STAGING_JC.TRIPS_LEGACY_V2
+    UNION ALL
+    SELECT 'STAGING_JC', 'TRIPS_MODERN',    COUNT(*) FROM CITIBIKE_SYSTEM_DATA.STAGING_JC.TRIPS_MODERN
+) t ON t.SF_SCHEMA = lc.SF_SCHEMA AND t.SF_TABLE = lc.SF_TABLE
+ORDER BY lc.SF_SCHEMA, lc.SF_TABLE;
+
+
+-- =============================================================
+-- SECTION 2 — LOAD STAGE_MANIFEST FROM PYTHON OUTPUT
+-- =============================================================
+-- Run this once after stage_files.py completes.
+-- Replace the VALUES with the contents of your gzip_manifest.jsonl,
+-- or use a COPY INTO from a stage if the file is already uploaded.
+--
+-- Quickest approach: load via Python (one-time script):
+--
+--   import json, snowflake.connector
+--   from pathlib import Path
+--   import snowflake_config as cfg
+--
+--   TABLE_MAP = {
+--       "dc497b4333c4": ("STAGING_JC",  "TRIPS_MODERN"),
+--       "e24ee8457e0e": ("STAGING_NYC", "TRIPS_LEGACY_V1"),
+--       "473144999085": ("STAGING_JC",  "TRIPS_LEGACY_V1"),
+--       # add others as discovered
+--   }
+--   SCHEMA_MAP = {"nyc": "STAGING_NYC", "jersey_city": "STAGING_JC"}
+--
+--   conn = snowflake.connector.connect(
+--       account=cfg.ACCOUNT, user=cfg.USER, password=cfg.PASSWORD,
+--       warehouse=cfg.WAREHOUSE, database=cfg.DATABASE, role=cfg.ROLE,
+--   )
+--   rows = []
+--   with open("gzip_staging/gzip_manifest.jsonl") as f:
+--       for line in f:
+--           rec = json.loads(line.strip())
+--           sk  = rec["schema_key"]
+--           sf_schema, sf_table = TABLE_MAP.get(sk, (None, None))
+--           if not sf_schema:
+--               continue
+--           rows.append((
+--               rec["output_file"], rec["region"], sk,
+--               sf_schema, sf_table,
+--               rec.get("gzip_size_bytes", 0),
+--               len(rec.get("source_files", [])),
+--           ))
+--   with conn.cursor() as cur:
+--       cur.executemany(
+--           "INSERT INTO CITIBIKE_SYSTEM_DATA.LOGGING.STAGE_MANIFEST "
+--           "(OUTPUT_FILE,REGION,SCHEMA_KEY,SF_SCHEMA,SF_TABLE,"
+--           " GZIP_SIZE_BYTES,SOURCE_FILE_COUNT) "
+--           "SELECT %s,%s,%s,%s,%s,%s,%s "
+--           "WHERE NOT EXISTS ("
+--           "  SELECT 1 FROM CITIBIKE_SYSTEM_DATA.LOGGING.STAGE_MANIFEST "
+--           "  WHERE OUTPUT_FILE = %s)",
+--           [(r + (r[0],)) for r in rows],
+--       )
+--   conn.close()
+-- =============================================================
+
+
+-- =============================================================
+-- SECTION 3 — STORED PROCEDURE
+-- =============================================================
+
+CREATE OR REPLACE PROCEDURE CITIBIKE_SYSTEM_DATA.LOGGING.SP_INGEST_STAGED_FILES(
+    P_REGION VARCHAR   -- 'nyc' | 'jersey_city' | 'all'
+)
+RETURNS VARCHAR
+LANGUAGE JAVASCRIPT
+EXECUTE AS CALLER
+AS
+$$
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+const DB      = "CITIBIKE_SYSTEM_DATA";
+const LOGGING = DB + ".LOGGING";
+
+function run(sql, binds) {
+    return binds
+        ? snowflake.execute({ sqlText: sql, binds: binds })
+        : snowflake.execute({ sqlText: sql });
+}
+
+function nowUtc() {
+    return new Date().toISOString().replace("T", " ").replace("Z", "+00:00");
+}
+
+// ── column definitions ───────────────────────────────────────────────────────
+// Positional ($1..$N) to be robust to CSV header casing.
+// Order must match the DDL column order in citibike_ddl.sql.
+
+const TABLE_COLS = {
+    "TRIPS_LEGACY_V1": {
+        n: 15,
+        names: [
+            "tripduration","starttime","stoptime",
+            "start_station_id","start_station_name",
+            "start_station_latitude","start_station_longitude",
+            "end_station_id","end_station_name",
+            "end_station_latitude","end_station_longitude",
+            "bikeid","usertype","birth_year","gender"
+        ]
+    },
+    "TRIPS_LEGACY_V2": {
+        n: 15,
+        names: [
+            "trip_duration","start_time","stop_time",
+            "start_station_id","start_station_name",
+            "start_station_latitude","start_station_longitude",
+            "end_station_id","end_station_name",
+            "end_station_latitude","end_station_longitude",
+            "bike_id","user_type","birth_year","gender"
+        ]
+    },
+    "TRIPS_MODERN": {
+        n: 13,
+        names: [
+            "ride_id","rideable_type","started_at","ended_at",
+            "start_station_name","start_station_id",
+            "end_station_name","end_station_id",
+            "start_lat","start_lng","end_lat","end_lng",
+            "member_casual"
+        ]
+    }
+};
+
+// ── fetch pending files ───────────────────────────────────────────────────────
+
+const pendingSql = `
+    SELECT
+        m.OUTPUT_FILE,
+        m.REGION,
+        m.SCHEMA_KEY,
+        m.SF_SCHEMA,
+        m.SF_TABLE,
+        m.GZIP_SIZE_BYTES,
+        COALESCE(l.ATTEMPT, 0) AS LAST_ATTEMPT
+    FROM ${LOGGING}.STAGE_MANIFEST m
+    LEFT JOIN ${LOGGING}.V_LATEST_INGEST_STATUS l
+           ON l.OUTPUT_FILE = m.OUTPUT_FILE
+    WHERE COALESCE(l.STATUS, 'PENDING') != 'SUCCESS'
+      AND (? = 'all' OR m.REGION = ?)
+    ORDER BY m.REGION, m.SF_TABLE, m.OUTPUT_FILE
+`;
+
+const pending = run(pendingSql, [P_REGION, P_REGION]);
+
+let totalFiles  = 0;
+let successCount = 0;
+let failCount    = 0;
+let skipCount    = 0;
+
+// ── process each file ─────────────────────────────────────────────────────────
+
+while (pending.next()) {
+
+    const outputFile   = pending.getColumnValue("OUTPUT_FILE");
+    const region       = pending.getColumnValue("REGION");
+    const schemaKey    = pending.getColumnValue("SCHEMA_KEY");
+    const sfSchema     = pending.getColumnValue("SF_SCHEMA");
+    const sfTable      = pending.getColumnValue("SF_TABLE");
+    const gzipBytes    = pending.getColumnValue("GZIP_SIZE_BYTES") || 0;
+    const lastAttempt  = pending.getColumnValue("LAST_ATTEMPT");
+
+    totalFiles++;
+    const attempt      = lastAttempt + 1;
+    const gzipMb       = (gzipBytes / (1024 * 1024)).toFixed(2);
+    const startedAt    = nowUtc();
+
+    // ── look up column mapping ───────────────────────────────────────────────
+    const colDef = TABLE_COLS[sfTable];
+    if (!colDef) {
+        const errMsg = `No column mapping for table '${sfTable}'. Add it to TABLE_COLS in SP.`;
+        run(
+            `INSERT INTO ${LOGGING}.INGEST_LOG
+             (OUTPUT_FILE,REGION,SCHEMA_KEY,SF_SCHEMA,SF_TABLE,GZIP_SIZE_MB,
+              ATTEMPT,TRIGGERED_BY,STARTED_AT_UTC,ENDED_AT_UTC,
+              STATUS,ROWS_LOADED,ERRORS_SEEN,ERROR_MESSAGE)
+             VALUES(?,?,?,?,?,?,?,'SP_INGEST_STAGED_FILES',?,?,
+                    'FAILED',0,0,?)`,
+            [outputFile,region,schemaKey,sfSchema,sfTable,gzipMb,
+             attempt,startedAt,nowUtc(),errMsg]
+        );
+        failCount++;
+        continue;
+    }
+
+    // ── build COPY SQL ───────────────────────────────────────────────────────
+    const stageFqn    = `${DB}.${sfSchema}.RAW_INGESTION`;
+    const tableFqn    = `${DB}.${sfSchema}.${sfTable}`;
+    const filename    = outputFile.split("/").pop();   // just the .csv.gz name
+    const stagePath   = `@${stageFqn}/${filename}`;
+
+    // positional $1..$N for data cols
+    const positional  = colDef.names.map((_, i) => `$${i + 1}`).join(", ");
+    const targetCols  = colDef.names.join(", ") + ", _source_file, _source_row_number";
+
+    const copySql = `
+        COPY INTO ${tableFqn} (
+            ${targetCols}
+        )
+        FROM (
+            SELECT
+                ${positional},
+                METADATA$FILENAME,
+                METADATA$FILE_ROW_NUMBER
+            FROM ${stagePath}
+        )
+        FILE_FORMAT = (
+            TYPE                         = CSV
+            COMPRESSION                  = GZIP
+            SKIP_HEADER                  = 1
+            FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+            NULL_IF                      = ('', 'NULL', 'null')
+            EMPTY_FIELD_AS_NULL          = TRUE
+            DATE_FORMAT                  = AUTO
+            TIMESTAMP_FORMAT             = AUTO
+        )
+        ON_ERROR  = 'CONTINUE'
+        PURGE     = TRUE
+    `;
+
+    // ── execute COPY and log result ──────────────────────────────────────────
+    let status       = "FAILED";
+    let rowsLoaded   = 0;
+    let errorsSeenN  = 0;
+    let copyStatuses = "";
+    let errorMsg     = null;
+
+    try {
+        const copyResult = run(copySql);
+
+        // COPY result cols: 0=file 1=status 2=rows_parsed 3=rows_loaded
+        //                   4=errors_seen 5=first_error_line 6=first_error_char
+        //                   7=first_error_col_name 8=first_error_col_type 9=first_error_message
+        const statuses = new Set();
+        while (copyResult.next()) {
+            rowsLoaded  += (copyResult.getColumnValue(4) || 0);   // col index 3 (0-based)
+            errorsSeenN += (copyResult.getColumnValue(5) || 0);   // col index 4
+            statuses.add(copyResult.getColumnValue(2));           // col index 1 = status
+        }
+        copyStatuses = Array.from(statuses).join("|");
+
+        if (copyStatuses.includes("LOAD_SKIPPED")) {
+            status   = "FAILED";
+            errorMsg = "COPY returned LOAD_SKIPPED — file already in Snowflake load history. "
+                     + "TRUNCATE the target table and call SP with FORCE handling, or use "
+                     + "ALTER TABLE ... REFRESH to clear load history.";
+            failCount++;
+        } else {
+            status = "SUCCESS";
+            successCount++;
+        }
+
+    } catch(e) {
+        errorMsg = e.message;
+        failCount++;
+    }
+
+    const endedAt = nowUtc();
+
+    run(
+        `INSERT INTO ${LOGGING}.INGEST_LOG
+         (OUTPUT_FILE,REGION,SCHEMA_KEY,SF_SCHEMA,SF_TABLE,GZIP_SIZE_MB,
+          ATTEMPT,TRIGGERED_BY,STARTED_AT_UTC,ENDED_AT_UTC,
+          STATUS,ROWS_LOADED,ERRORS_SEEN,COPY_STATUS_RAW,ERROR_MESSAGE)
+         VALUES(?,?,?,?,?,?,?,'SP_INGEST_STAGED_FILES',?,?,
+                ?,?,?,?,?)`,
+        [
+            outputFile, region, schemaKey, sfSchema, sfTable, gzipMb,
+            attempt, startedAt, endedAt,
+            status, rowsLoaded, errorsSeenN, copyStatuses, errorMsg
+        ]
+    );
+}
+
+// ── return summary ────────────────────────────────────────────────────────────
+
+const summary = `SP_INGEST_STAGED_FILES complete | `
+              + `region=${P_REGION} | `
+              + `total=${totalFiles} | `
+              + `success=${successCount} | `
+              + `failed=${failCount} | `
+              + `skipped=${skipCount}`;
+
+return summary;
+$$;
+
+
+-- =============================================================
+-- SECTION 4 — QUICK-REFERENCE MONITORING QUERIES
+-- =============================================================
+
+-- 1. Run status overview
+SELECT
+    STATUS,
+    REGION,
+    SF_TABLE,
+    COUNT(*)         AS FILE_COUNT,
+    SUM(ROWS_LOADED) AS TOTAL_ROWS,
+    SUM(ERRORS_SEEN) AS TOTAL_ERRORS
+FROM CITIBIKE_SYSTEM_DATA.LOGGING.INGEST_LOG
+GROUP BY STATUS, REGION, SF_TABLE
+ORDER BY REGION, SF_TABLE, STATUS;
+
+-- 2. Files still pending
+SELECT * FROM CITIBIKE_SYSTEM_DATA.LOGGING.V_PENDING_FILES;
+
+-- 3. Row count cross-check (log totals vs actual table counts)
+SELECT * FROM CITIBIKE_SYSTEM_DATA.LOGGING.V_TABLE_ROW_COUNTS;
+
+-- 4. Any file with >0 errors (partial loads)
+SELECT
+    OUTPUT_FILE, SF_TABLE, ROWS_LOADED, ERRORS_SEEN, COPY_STATUS_RAW
+FROM CITIBIKE_SYSTEM_DATA.LOGGING.INGEST_LOG
+WHERE STATUS  = 'SUCCESS'
+  AND ERRORS_SEEN > 0
+ORDER BY ERRORS_SEEN DESC;
+
+-- 5. Failed files with their error messages
+SELECT
+    OUTPUT_FILE, ATTEMPT, ERROR_MESSAGE, ENDED_AT_UTC
+FROM CITIBIKE_SYSTEM_DATA.LOGGING.V_LATEST_INGEST_STATUS
+WHERE STATUS = 'FAILED'
+ORDER BY ENDED_AT_UTC DESC;

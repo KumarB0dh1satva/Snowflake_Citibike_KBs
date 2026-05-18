@@ -2,15 +2,15 @@
 
 Python pipeline to discover, download, and extract Citi Bike trip data from the public S3 bucket (`https://s3.amazonaws.com/tripdata/`), compress it for staging, and load it into Snowflake.
 
+**Recommended Snowflake path:** upload with `stage_files.py` → register files in `LOGGING.STAGE_MANIFEST` with `ingest_stage_files.py` → `COPY INTO` staging tables via `LOGGING.SP_INGEST_STAGED_FILES`. See [docs/SNOWFLAKE_INGEST.md](docs/SNOWFLAKE_INGEST.md) for the full operator runbook.
+
 ## Prerequisites
 
 - Python 3.13+ (tested with 3.13)
 - Enough local disk for raw zips and extracted CSVs (tens of GB for a full historical run)
-- A Snowflake account with:
-  - Database: `CITIBIKE_SYSTEM_DATA`
-  - Schemas: `STAGING_NYC`, `STAGING_JC`
-  - Internal stages: `RAW_INGESTION` in each schema
-  - Staging tables from `Snowflake_Scripts/` (only if using `load_to_snowflake.py`)
+- Snowflake database `CITIBIKE_SYSTEM_DATA` with:
+  - Schemas `STAGING_NYC`, `STAGING_JC` (tables + `RAW_INGESTION` stages)
+  - Schema `LOGGING` (manifest, ingest log, stored procedure) — deploy from `Snowflake_Scripts/`
 
 ## Setup
 
@@ -18,88 +18,68 @@ Python pipeline to discover, download, and extract Citi Bike trip data from the 
 python -m venv venv
 source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-### Snowflake credentials
-
-Secrets are kept out of git. Copy the example file and fill in your account details:
-
-```bash
 cp snowflake_credentials.example.py snowflake_credentials.py
 # edit snowflake_credentials.py
 ```
 
-Alternatively, set environment variables (they override the credentials file):
-
-```bash
-export SF_ACCOUNT="your_account_identifier"
-export SF_USER="your_username"
-export SF_PASSWORD="your_password"
-export SF_WAREHOUSE="LOADING_LOCAL"
-export SF_DATABASE="CITIBIKE_SYSTEM_DATA"
-export SF_ROLE="SYSADMIN"
-```
-
-Non-secret settings (schema names, stage name, table mapping, retries) live in `snowflake_config.py`.
+Non-secret routing (regions, tables, stage name, parallelism) lives in `snowflake_config.py`. Env vars `SF_*` override credentials when set.
 
 ## Snowflake ingest architecture
 
-After compression (step 5), pick **one** Python loader:
-
 ```text
-  gzip_staging/*.csv.gz
+  gzip_staging/*.csv.gz + gzip_manifest.jsonl
            │
-           ├─► stage_files.py  (alternative: stage only)
-           │         parallel PUT → @STAGING_NYC|JC.RAW_INGESTION
-           │         log: snowflake_stage_loading_log.jsonl
+           ├─► [Recommended] 3-step staged ingest
+           │       1. stage_files.py          → @STAGING_*/RAW_INGESTION
+           │       2. ingest_stage_files.py   → LOGGING.STAGE_MANIFEST
+           │       3. SP_INGEST_STAGED_FILES    → STAGING_*.TRIPS_*
+           │       Monitor: LOGGING.INGEST_LOG + Snowflake_Scripts/TEST/
            │
-           └─► load_to_snowflake.py  (alternative: stage + tables)
-                     PUT + COPY INTO staging tables
+           └─► [Alternative] load_to_snowflake.py
+                     PUT + COPY in one Python script
                      log: snowflake_ingest_log.jsonl
 ```
 
-| Script | What it does | Log file | Tables required? |
-|--------|----------------|----------|------------------|
-| `stage_files.py` | Upload `.csv.gz` to `RAW_INGESTION` only (parallel) | `snowflake_stage_loading_log.jsonl` | No |
-| `load_to_snowflake.py` | `PUT` + `COPY INTO` `TRIPS_*` tables | `snowflake_ingest_log.jsonl` | Yes (run `Snowflake_Scripts/` DDL first) |
+| Step | Tool | Log / audit |
+|------|------|-------------|
+| PUT to stage | `stage_files.py` | `snowflake_stage_loading_log.jsonl` |
+| Register work queue | `ingest_stage_files.py` | `LOGGING.STAGE_MANIFEST` |
+| COPY into tables | `LOGGING.SP_INGEST_STAGED_FILES` | `LOGGING.INGEST_LOG` |
+| All-in-one (alt.) | `load_to_snowflake.py` | `snowflake_ingest_log.jsonl` |
 
-Both read `gzip_staging/gzip_manifest.jsonl`, use `snowflake_credentials.py` / `snowflake_config.py`, and target the same internal stages. `stage_files.py` does not run `COPY INTO` or reference downstream Snowflake jobs.
+Deploy SQL in order: [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md). Procedure details: [Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt](Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt).
 
 ## Project structure
 
-| Script / file | Purpose |
-|---------------|---------|
-| `s3_index_to_csv.py` | Lists the public S3 bucket and writes `citibike_s3_file_index.csv` |
-| `download_citibike_data.py` | Downloads zips, extracts them, logs to `download_log.jsonl` |
-| `analyze_extracted_schema.py` | Scans `extracted/` for CSV schemas and nested zips; writes `analysis_output/` |
-| `extract_nested_zips.py` | Extracts inner monthly zips for annual bundles |
-| `compress_for_snowflake.py` | Builds `.csv.gz` parts (100–250 MB) under `gzip_staging/` |
-| `stage_files.py` | Parallel **PUT** to `RAW_INGESTION` only; logs to `snowflake_stage_loading_log.jsonl` |
-| `load_to_snowflake.py` | **PUT + COPY INTO** staging tables from Python |
-| `snowflake_config.py` | Region → schema, `schema_key` → table, stage name (no passwords) |
-| `snowflake_credentials.py` | Account, user, password, warehouse, database, role (**gitignored**) |
-| `snowflake_credentials.example.py` | Template for `snowflake_credentials.py` |
-| `Snowflake_Scripts/` | `CREATE TABLE` DDL for `STAGING_NYC` and `STAGING_JC` |
+### Python
 
-### Snowflake DDL (`Snowflake_Scripts/`)
+| Script | Purpose |
+|--------|---------|
+| `s3_index_to_csv.py` | List S3 bucket → `citibike_s3_file_index.csv` |
+| `download_citibike_data.py` | Download and extract zips |
+| `analyze_extracted_schema.py` | Schema inventory under `analysis_output/` |
+| `extract_nested_zips.py` | Extract nested annual bundles |
+| `compress_for_snowflake.py` | Build regional `.csv.gz` parts + `gzip_manifest.jsonl` |
+| `stage_files.py` | Parallel PUT to `RAW_INGESTION` |
+| `ingest_stage_files.py` | Load manifest into `LOGGING.STAGE_MANIFEST` |
+| `load_to_snowflake.py` | Alternative: PUT + COPY from Python |
+| `snowflake_config.py` | Region / `schema_key` → table routing (no secrets) |
+| `snowflake_credentials.py` | Credentials (**gitignored**) |
 
-Run these in the Snowflake UI (or `snowsql`) **once** before loading. Each file uses `CREATE TABLE IF NOT EXISTS` on `CITIBIKE_SYSTEM_DATA`.
+### Snowflake (`Snowflake_Scripts/`)
 
-| Path | Table | Source CSV layout |
-|------|-------|-------------------|
-| `STAGING_NYC/TRIPS_MODERN.sql` | `STAGING_NYC.TRIPS_MODERN` | schema_1 — 13 cols, `ride_id` (2020+) |
-| `STAGING_NYC/TRIPS_LEGACY_V1.sql` | `STAGING_NYC.TRIPS_LEGACY_V1` | schema_2 — lowercase legacy |
-| `STAGING_NYC/TRIPS_LEGACY_V2.sql` | `STAGING_NYC.TRIPS_LEGACY_V2` | schema_3 — Title Case legacy |
-| `STAGING_JC/TRIPS_MODERN.sql` | `STAGING_JC.TRIPS_MODERN` | Same as NYC modern |
-| `STAGING_JC/TRIPS_LEGACY_V1.sql` | `STAGING_JC.TRIPS_LEGACY_V1` | Same as NYC legacy v1 |
-| `STAGING_JC/TRIPS_LEGACY_V2.sql` | `STAGING_JC.TRIPS_LEGACY_V2` | Same as NYC legacy v2 |
+| Folder | Contents |
+|--------|----------|
+| `STAGING_NYC/`, `STAGING_JC/` | `CREATE TABLE` for `TRIPS_MODERN`, `TRIPS_LEGACY_V1`, `TRIPS_LEGACY_V2` |
+| `LOGGING/` | `STAGE_MANIFEST`, `INGEST_LOG`, views, `SP_INGEST_STAGED_FILES.sql`, full doc `.txt` |
+| `TEST/` | Operator queries: pending files, failures, row-count cross-check |
 
-Tables include metadata columns `_SOURCE_FILE`, `_SOURCE_ROW_NUMBER`, `_LOADED_AT` (filled by the ingest procedure or loader).
+### Documentation
 
-```sql
-SHOW TABLES IN SCHEMA CITIBIKE_SYSTEM_DATA.STAGING_NYC;
-SHOW TABLES IN SCHEMA CITIBIKE_SYSTEM_DATA.STAGING_JC;
-```
+| Doc | Contents |
+|-----|----------|
+| [docs/SNOWFLAKE_INGEST.md](docs/SNOWFLAKE_INGEST.md) | Staged ingest runbook, monitoring, troubleshooting |
+| [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md) | SQL deploy order and object index |
 
 ### Routing (`snowflake_config.py`)
 
@@ -114,130 +94,81 @@ SHOW TABLES IN SCHEMA CITIBIKE_SYSTEM_DATA.STAGING_JC;
 | `473144999085` | `TRIPS_LEGACY_V1` | schema_2 — lowercase legacy |
 | `e24ee8457e0e` | `TRIPS_LEGACY_V2` | schema_3 — Title Case legacy |
 
-`schema_key` is an MD5 fingerprint of column headers from `compress_for_snowflake.py`, not a Snowflake schema name.
-
 ## Pipeline (run in order)
 
-### 1. Build S3 file index
+### 1–5. Local data prep
 
 ```bash
 python s3_index_to_csv.py
-```
-
-**Output:** `citibike_s3_file_index.csv`
-
-### 2. Download and extract
-
-```bash
 python download_citibike_data.py
-```
-
-**Outputs:** `downloads/`, `extracted/`, `download_log.jsonl`
-
-### 3. Analyze extracted data
-
-```bash
 python analyze_extracted_schema.py
-```
-
-**Outputs:** `analysis_output/` (inventory, `schema_signatures.csv`, etc.)
-
-### 4. Extract nested zips (when needed)
-
-```bash
-python extract_nested_zips.py
-```
-
-**Output:** `nested_extract_log.jsonl`
-
-### 5. Compress for Snowflake staging
-
-```bash
+python extract_nested_zips.py          # when analysis_summary lists nested bundles
 python compress_for_snowflake.py
 ```
 
-**Outputs:**
+Outputs: `downloads/`, `extracted/`, `gzip_staging/`, `gzip_manifest.jsonl`.
 
-- `gzip_staging/nyc/{schema_key}/*.csv.gz`
-- `gzip_staging/jersey_city/{schema_key}/*.csv.gz`
-- `gzip_staging/gzip_manifest.jsonl`
+### 6. Snowflake load (recommended)
 
-Options: `--region nyc|jersey_city|all`, `--dry-run`, `--min-mb 100`, `--max-mb 250`
+**6a. One-time Snowflake deploy**
 
-### 6a. Load to stage only (`stage_files.py`)
+Run scripts listed in [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md) (staging tables → LOGGING tables/views → stored procedure).
 
-Uploads local `.csv.gz` files to `RAW_INGESTION` in parallel. No `COPY INTO`, no table writes, no downstream steps in this script.
-
-#### Pre-flight
-
-| Check | |
-|-------|---|
-| `snowflake_credentials.py` configured | |
-| `RAW_INGESTION` stages exist in `STAGING_NYC` and `STAGING_JC` | |
-| `gzip_manifest.jsonl` and local `.csv.gz` files present | |
+**6b. Upload gzip files to stage**
 
 ```bash
-python stage_files.py --dry-run              # preview PUT targets
-python stage_files.py --region jersey_city   # 7 files — good first test
-python stage_files.py --workers 4            # parallel uploads (default from snowflake_config.py)
-python stage_files.py                        # all pending (~59 parts)
+python stage_files.py --dry-run
+python stage_files.py --region jersey_city --workers 4
+python stage_files.py --workers 4
+python stage_files.py --list-stage
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--region nyc` / `jersey_city` / `all` | Limit by region |
-| `--workers N` | Concurrent file uploads (default: `PARALLEL_STAGE_WORKERS` in config) |
-| `--dry-run` | Print plan only |
-| `--reset-failed` | Re-queue after max retries |
-| `--force` | Re-upload with `OVERWRITE=TRUE` |
-| `--no-overwrite` | Use `OVERWRITE=FALSE` (PUT may return `SKIPPED` if file already on stage) |
-| `--list-stage` | Print files currently on each `RAW_INGESTION` stage |
+Log: `snowflake_stage_loading_log.jsonl`. Flags: `--force`, `--no-overwrite`, `--reset-failed` — see [docs/SNOWFLAKE_INGEST.md](docs/SNOWFLAKE_INGEST.md).
 
-Default PUT uses `OVERWRITE=TRUE` (`STAGE_PUT_OVERWRITE` in `snowflake_config.py`). After each PUT, the script runs `LIST` on the stage to verify the file is present.
-
-**Log:** `snowflake_stage_loading_log.jsonl` — `SUCCESS` with `put_status` `UPLOADED` (new bytes sent) or `SKIPPED` (already on stage, verified). Console shows `ON_STAGE` for the latter — not a failure. Files with verified `SUCCESS` are skipped on re-run unless `--force`.
+**6c. Register files for the stored procedure**
 
 ```bash
-python stage_files.py --list-stage   # confirm what Snowflake has
+python ingest_stage_files.py
 ```
 
-```bash
-tail -f snowflake_stage_loading_log.jsonl
+Inserts into `LOGGING.STAGE_MANIFEST` (idempotent per `OUTPUT_FILE`).
+
+**6d. COPY staged files into tables**
+
+```sql
+SELECT * FROM CITIBIKE_SYSTEM_DATA.LOGGING.V_PENDING_FILES;
+
+CALL CITIBIKE_SYSTEM_DATA.LOGGING.SP_INGEST_STAGED_FILES('all');
+-- CALL ... ('nyc');  CALL ... ('jersey_city');
 ```
 
-Tune parallelism in `snowflake_config.py`:
+Monitor with `Snowflake_Scripts/TEST/*.sql` or:
 
-- `PARALLEL_STAGE_WORKERS` — how many files upload at once (`--workers`)
-- `PARALLEL_PUT_THREADS` — Snowflake `PUT` threads per file
+```sql
+SELECT * FROM CITIBIKE_SYSTEM_DATA.LOGGING.V_LATEST_INGEST_STATUS ORDER BY ENDED_AT_UTC DESC;
+SELECT * FROM CITIBIKE_SYSTEM_DATA.LOGGING.V_TABLE_ROW_COUNTS;
+```
 
-### 6b. Load to stage + tables (`load_to_snowflake.py`)
+### 6 (alternative). `load_to_snowflake.py`
 
-Uploads and `COPY INTO` staging tables in one Python run:
+Single-script PUT + COPY; does not use `LOGGING` or the stored procedure:
 
 ```bash
-python load_to_snowflake.py --dry-run
 python load_to_snowflake.py --region jersey_city
 python load_to_snowflake.py
 ```
 
-**Log:** `snowflake_ingest_log.jsonl`
-
-Requires staging tables from `Snowflake_Scripts/` before running.
+Requires staging table DDL only. Log: `snowflake_ingest_log.jsonl`.
 
 ## What is not in this repo
 
-See `.gitignore`:
+See `.gitignore`: `downloads/`, `extracted/`, `gzip_staging/nyc/*`, `gzip_staging/jersey_city/*`, `venv/`, `snowflake_credentials.py`.
 
-- `downloads/`, `extracted/`
-- `gzip_staging/nyc/*`, `gzip_staging/jersey_city/*` (manifest kept)
-- `venv/`, `__pycache__/`
-- `snowflake_credentials.py`
-
-Generated logs (`snowflake_stage_loading_log.jsonl`, `snowflake_ingest_log.jsonl`) may exist locally; they are runtime artifacts.
+Runtime logs: `snowflake_stage_loading_log.jsonl`, `snowflake_ingest_log.jsonl`. Snowflake-side audit: `LOGGING.INGEST_LOG`.
 
 ## Schema notes
 
-Use `analysis_output/schema_signatures.csv` with `Snowflake_Scripts/` when adjusting tables or `SCHEMA_KEY_TO_TABLE` in `snowflake_config.py`.
+Use `analysis_output/schema_signatures.csv` with `Snowflake_Scripts/` when changing DDL or `SCHEMA_KEY_TO_TABLE` in `snowflake_config.py`.
 
 ## License / data
 
