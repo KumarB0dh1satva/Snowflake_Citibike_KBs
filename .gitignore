@@ -5,4 +5,4 @@
 /gzip_staging/nyc/*
 /gzip_staging/jersey_city/*
 snowflake_credentials.py
-Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt
+/Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt
