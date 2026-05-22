@@ -2,7 +2,7 @@
 
 Python pipeline to discover, download, and extract Citi Bike trip data from the public S3 bucket (`https://s3.amazonaws.com/tripdata/`), compress it for staging, and load it into Snowflake.
 
-**Recommended Snowflake path:** upload with `stage_files.py` → register files in `LOGGING.STAGE_MANIFEST` with `ingest_stage_files.py` → `COPY INTO` staging tables via `LOGGING.SP_INGEST_STAGED_FILES`. See [docs/SNOWFLAKE_INGEST.md](docs/SNOWFLAKE_INGEST.md) for the full operator runbook.
+**Recommended Snowflake path:** `stage_files.py` → `populate_stage_manifest.py` → `SP_INGEST_STAGED_FILES` → `SP_LOAD_TRIPS_ALL` into unified `TRIPS_ALL`. See [docs/SNOWFLAKE_INGEST.md](docs/SNOWFLAKE_INGEST.md) and [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md).
 
 ## Prerequisites
 
@@ -31,8 +31,9 @@ Non-secret routing (regions, tables, stage name, parallelism) lives in `snowflak
            │
            ├─► [Recommended] 3-step staged ingest
            │       1. stage_files.py          → @STAGING_*/RAW_INGESTION
-           │       2. ingest_stage_files.py   → LOGGING.STAGE_MANIFEST
-           │       3. SP_INGEST_STAGED_FILES    → STAGING_*.TRIPS_*
+           │       2. populate_stage_manifest.py → LOGGING.STAGE_MANIFEST
+           │       3. SP_INGEST_STAGED_FILES     → STAGING_*.TRIPS_*
+           │       4. SP_LOAD_TRIPS_ALL          → STAGING_*.TRIPS_ALL
            │       Monitor: LOGGING.INGEST_LOG + Snowflake_Scripts/TEST/
            │
            └─► [Alternative] load_to_snowflake.py
@@ -43,8 +44,9 @@ Non-secret routing (regions, tables, stage name, parallelism) lives in `snowflak
 | Step | Tool | Log / audit |
 |------|------|-------------|
 | PUT to stage | `stage_files.py` | `snowflake_stage_loading_log.jsonl` |
-| Register work queue | `ingest_stage_files.py` | `LOGGING.STAGE_MANIFEST` |
-| COPY into tables | `LOGGING.SP_INGEST_STAGED_FILES` | `LOGGING.INGEST_LOG` |
+| Register work queue | `populate_stage_manifest.py` | `LOGGING.STAGE_MANIFEST` |
+| COPY into staging tables | `LOGGING.SP_INGEST_STAGED_FILES` | `LOGGING.INGEST_LOG` |
+| Merge to unified table | `STAGING_*.SP_LOAD_TRIPS_ALL` | `TRIPS_ALL` (per region) |
 | All-in-one (alt.) | `load_to_snowflake.py` | `snowflake_ingest_log.jsonl` |
 
 Deploy SQL in order: [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md). Procedure details: [Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt](Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt).
@@ -61,7 +63,8 @@ Deploy SQL in order: [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md).
 | `extract_nested_zips.py` | Extract nested annual bundles |
 | `compress_for_snowflake.py` | Build regional `.csv.gz` parts + `gzip_manifest.jsonl` |
 | `stage_files.py` | Parallel PUT to `RAW_INGESTION` |
-| `ingest_stage_files.py` | Load manifest into `LOGGING.STAGE_MANIFEST` |
+| `populate_stage_manifest.py` | Load manifest into `LOGGING.STAGE_MANIFEST` |
+| `ingest_stage_files.py` | Thin wrapper / legacy alias for manifest load |
 | `load_to_snowflake.py` | Alternative: PUT + COPY from Python |
 | `snowflake_config.py` | Region / `schema_key` → table routing (no secrets) |
 | `snowflake_credentials.py` | Credentials (**gitignored**) |
@@ -70,7 +73,7 @@ Deploy SQL in order: [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md).
 
 | Folder | Contents |
 |--------|----------|
-| `STAGING_NYC/`, `STAGING_JC/` | `CREATE TABLE` for `TRIPS_MODERN`, `TRIPS_LEGACY_V1`, `TRIPS_LEGACY_V2` |
+| `STAGING_NYC/`, `STAGING_JC/` | Staging tables (`TRIPS_*`), unified `TRIPS_ALL`, `SP_LOAD_*` merge procedures |
 | `LOGGING/` | `STAGE_MANIFEST`, `INGEST_LOG`, views, `SP_INGEST_STAGED_FILES.sql`, full doc `.txt` |
 | `TEST/` | Operator queries: pending files, failures, row-count cross-check |
 
@@ -112,7 +115,7 @@ Outputs: `downloads/`, `extracted/`, `gzip_staging/`, `gzip_manifest.jsonl`.
 
 **6a. One-time Snowflake deploy**
 
-Run scripts listed in [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md) (staging tables → LOGGING tables/views → stored procedure).
+Run scripts listed in [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md): staging tables → `TRIPS_ALL` → LOGGING → `SP_INGEST_STAGED_FILES` → `SP_LOAD_*` procedures.
 
 **6b. Upload gzip files to stage**
 
@@ -128,12 +131,12 @@ Log: `snowflake_stage_loading_log.jsonl`. Flags: `--force`, `--no-overwrite`, `-
 **6c. Register files for the stored procedure**
 
 ```bash
-python ingest_stage_files.py
+python populate_stage_manifest.py
 ```
 
 Inserts into `LOGGING.STAGE_MANIFEST` (idempotent per `OUTPUT_FILE`).
 
-**6d. COPY staged files into tables**
+**6d. COPY staged files into per-layout tables**
 
 ```sql
 SELECT * FROM CITIBIKE_SYSTEM_DATA.LOGGING.V_PENDING_FILES;
@@ -148,6 +151,20 @@ Monitor with `Snowflake_Scripts/TEST/*.sql` or:
 SELECT * FROM CITIBIKE_SYSTEM_DATA.LOGGING.V_LATEST_INGEST_STATUS ORDER BY ENDED_AT_UTC DESC;
 SELECT * FROM CITIBIKE_SYSTEM_DATA.LOGGING.V_TABLE_ROW_COUNTS;
 ```
+
+**6e. Merge staging tables into TRIPS_ALL**
+
+After ingest succeeds, normalize all layouts into one table per region:
+
+```sql
+CALL CITIBIKE_SYSTEM_DATA.STAGING_NYC.SP_LOAD_TRIPS_ALL();
+CALL CITIBIKE_SYSTEM_DATA.STAGING_JC.SP_LOAD_TRIPS_ALL();
+
+SELECT COUNT(*) FROM CITIBIKE_SYSTEM_DATA.STAGING_NYC.TRIPS_ALL;
+SELECT COUNT(*) FROM CITIBIKE_SYSTEM_DATA.STAGING_JC.TRIPS_ALL;
+```
+
+`SP_LOAD_TRIPS_*` procedures dedupe on `_SOURCE_FILE` + `_SOURCE_ROW_NUMBER`. Safe to re-run after new data lands in `TRIPS_MODERN` / `TRIPS_LEGACY_*`.
 
 ### 6 (alternative). `load_to_snowflake.py`
 

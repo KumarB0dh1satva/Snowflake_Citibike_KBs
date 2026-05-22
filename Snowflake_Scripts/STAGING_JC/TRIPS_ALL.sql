@@ -1,0 +1,31 @@
+-- -----------------------------------------------------------
+-- TRIPS_ALL
+-- Unified Jersey City trip table (modern + legacy layouts normalized).
+-- Populated by SP_LOAD_TRIPS_MODERN / SP_LOAD_TRIPS_LEGACY_V1 / V2.
+-- -----------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS CITIBIKE_SYSTEM_DATA.STAGING_JC.TRIPS_ALL (
+    TRIP_SK NUMBER AUTOINCREMENT PRIMARY KEY,
+    RIDE_ID VARCHAR(50),
+    RIDEABLE_TYPE VARCHAR(50),
+    BIKEID INT,
+    STARTED_AT TIMESTAMP_NTZ,
+    ENDED_AT TIMESTAMP_NTZ,
+    TRIP_DURATION NUMBER(38, 0),
+    START_STATION_NAME VARCHAR(255),
+    START_STATION_ID VARCHAR(50),
+    END_STATION_NAME VARCHAR(255),
+    END_STATION_ID VARCHAR(50),
+    START_LAT FLOAT,
+    START_LNG FLOAT,
+    END_LAT FLOAT,
+    END_LNG FLOAT,
+    MEMBER_CASUAL VARCHAR(50),
+    BIRTH_YEAR INT,
+    GENDER TINYINT,
+    _SOURCE_FILE VARCHAR(500),
+    _SOURCE_ROW_NUMBER INT,
+    _LOADED_AT TIMESTAMP_NTZ,
+    _LOADED_AT_TBL TIMESTAMP_NTZ
+)
+COMMENT = 'Citibike Jersey City combined trips (all schemas)';

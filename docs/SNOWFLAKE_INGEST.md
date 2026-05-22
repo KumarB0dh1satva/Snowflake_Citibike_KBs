@@ -1,6 +1,6 @@
 # Snowflake staged ingest — operator guide
 
-This document describes the **recommended** path from compressed local files to populated `STAGING_NYC` / `STAGING_JC` tables using `stage_files.py`, `ingest_stage_files.py`, and `LOGGING.SP_INGEST_STAGED_FILES`.
+This document describes the **recommended** path from compressed local files to populated `STAGING_NYC` / `STAGING_JC` tables using `stage_files.py`, `populate_stage_manifest.py`, `LOGGING.SP_INGEST_STAGED_FILES`, and optionally `SP_LOAD_TRIPS_ALL` into `TRIPS_ALL`.
 
 For S3 download and compression steps, see the main [README](../README.md).
 
@@ -12,7 +12,7 @@ For S3 download and compression steps, see the main [README](../README.md).
 │  *.csv.gz           │              │ @STAGING_JC.RAW_INGESTION  │
 └─────────────────────┘              └────────────┬─────────────┘
          │                                        │
-         │ ingest_stage_files.py                  │ SP_INGEST_STAGED_FILES
+         │ populate_stage_manifest.py             │ SP_INGEST_STAGED_FILES
          ▼                                        ▼
 ┌─────────────────────┐              ┌──────────────────────────┐
 │ LOGGING.            │              │ STAGING_NYC.TRIPS_*      │
@@ -63,7 +63,7 @@ python stage_files.py --list-stage                       # verify LIST output
 ### 3. Load manifest into LOGGING
 
 ```bash
-python ingest_stage_files.py
+python populate_stage_manifest.py
 ```
 
 Populates `LOGGING.STAGE_MANIFEST` from `gzip_manifest.jsonl` using `snowflake_config.py` routing. Safe to re-run (skips existing `OUTPUT_FILE` values).
@@ -92,7 +92,18 @@ Returns a summary string, e.g. `success=52 | failed=0`.
 
 Per-file results land in `LOGGING.INGEST_LOG` immediately (no need to wait for the whole batch).
 
-### 5. Monitor and validate
+### 5. Merge into TRIPS_ALL (optional unified table)
+
+After data is in `TRIPS_MODERN` / `TRIPS_LEGACY_V1` / `TRIPS_LEGACY_V2`:
+
+```sql
+CALL CITIBIKE_SYSTEM_DATA.STAGING_NYC.SP_LOAD_TRIPS_ALL();
+CALL CITIBIKE_SYSTEM_DATA.STAGING_JC.SP_LOAD_TRIPS_ALL();
+```
+
+Deploy `TRIPS_ALL.sql` and `SP_LOAD_*.sql` from `Snowflake_Scripts/STAGING_NYC/` and `STAGING_JC/` first. Procedures skip rows already present in `TRIPS_ALL` (same `_SOURCE_FILE` + `_SOURCE_ROW_NUMBER`).
+
+### 6. Monitor and validate
 
 ```sql
 -- Latest status per file
@@ -130,7 +141,7 @@ Table column order in the SP must match `Snowflake_Scripts/LOGGING/SP_INGEST_STA
 | `V_PENDING_FILES` non-empty after SP | COPY failed or not run | Check `INGEST_LOG`; run `TEST/FAILED_FILES.sql` |
 | `ROWS_LOADED = 0`, large `ERRORS_SEEN` | Column/type mismatch | Compare CSV sample to DDL; check SP `TABLE_COLS` order |
 | `LOAD_SKIPPED` in `COPY_STATUS_RAW` | Snowflake load history | See SP doc — may need truncate or load history refresh |
-| Manifest row missing | `ingest_stage_files.py` skipped unmapped key | Add key to `SCHEMA_KEY_TO_TABLE` in `snowflake_config.py` |
+| Manifest row missing | `populate_stage_manifest.py` skipped unmapped key | Add key to `SCHEMA_KEY_TO_TABLE` in `snowflake_config.py` |
 | Stage file not found | Basename mismatch | Ensure `stage_files.py` completed; basename = last segment of `output_file` |
 
 ## Related files
@@ -141,5 +152,5 @@ Table column order in the SP must match `Snowflake_Scripts/LOGGING/SP_INGEST_STA
 | [../Snowflake_Scripts/README.md](../Snowflake_Scripts/README.md) | SQL deploy order and object index |
 | [../Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt](../Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt) | Full procedure documentation |
 | [../stage_files.py](../stage_files.py) | Parallel PUT to stage |
-| [../ingest_stage_files.py](../ingest_stage_files.py) | Load `STAGE_MANIFEST` |
+| [../populate_stage_manifest.py](../populate_stage_manifest.py) | Load `STAGE_MANIFEST` |
 | [../snowflake_config.py](../snowflake_config.py) | Shared routing config |

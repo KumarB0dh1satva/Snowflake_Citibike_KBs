@@ -1,0 +1,18 @@
+-- -----------------------------------------------------------
+-- SP_LOAD_TRIPS_ALL
+-- Run all three merge procedures into STAGING_JC.TRIPS_ALL.
+-- -----------------------------------------------------------
+
+CREATE OR REPLACE PROCEDURE CITIBIKE_SYSTEM_DATA.STAGING_JC.SP_LOAD_TRIPS_ALL()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+BEGIN
+    CALL CITIBIKE_SYSTEM_DATA.STAGING_JC.SP_LOAD_TRIPS_MODERN();
+    CALL CITIBIKE_SYSTEM_DATA.STAGING_JC.SP_LOAD_TRIPS_LEGACY_V1();
+    CALL CITIBIKE_SYSTEM_DATA.STAGING_JC.SP_LOAD_TRIPS_LEGACY_V2();
+    RETURN 'SP_LOAD_TRIPS_ALL (JC): completed MODERN, LEGACY_V1, LEGACY_V2 — see each CALL result for row counts';
+END;
+$$;

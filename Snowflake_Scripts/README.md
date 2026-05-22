@@ -6,100 +6,116 @@ All objects live in database **`CITIBIKE_SYSTEM_DATA`**.
 
 | Schema | Purpose |
 |--------|---------|
-| `STAGING_NYC` | NYC trip tables + internal stage `RAW_INGESTION` |
-| `STAGING_JC` | Jersey City trip tables + internal stage `RAW_INGESTION` |
-| `LOGGING` | Work queue (`STAGE_MANIFEST`), run history (`INGEST_LOG`), monitoring views, ingest stored procedure |
-| `TEST` | Convenience SELECTs for operators (not a separate Snowflake schema — run these queries in a worksheet) |
+| `STAGING_NYC` | NYC staging tables, `TRIPS_ALL`, merge procedures, `RAW_INGESTION` |
+| `STAGING_JC` | Jersey City staging tables, `TRIPS_ALL`, merge procedures, `RAW_INGESTION` |
+| `LOGGING` | `STAGE_MANIFEST`, `INGEST_LOG`, views, `SP_INGEST_STAGED_FILES` |
+| `TEST/` | Operator SQL files (run in a worksheet) |
 
 ## Recommended deploy order
 
-Run in the Snowflake UI or `snowsql` in this order:
-
 | Step | Files | What it creates |
 |------|--------|-----------------|
-| 1 | `STAGING_NYC/*.sql`, `STAGING_JC/*.sql` | Six `TRIPS_*` staging tables |
+| 1a | `STAGING_NYC/TRIPS_*.sql`, `STAGING_JC/TRIPS_*.sql` | Six per-schema staging tables (`TRIPS_MODERN`, `TRIPS_LEGACY_V1`, `TRIPS_LEGACY_V2`) |
+| 1b | `STAGING_NYC/TRIPS_ALL.sql`, `STAGING_JC/TRIPS_ALL.sql` | Unified `TRIPS_ALL` table per region |
 | 2 | `LOGGING/STAGE_MANIFEST.sql` | `LOGGING.STAGE_MANIFEST` |
 | 3 | `LOGGING/INGEST_LOG.sql` | `LOGGING.INGEST_LOG` |
-| 4 | `LOGGING/V_LATEST_INGEST_STATUS.sql` | View — latest attempt per file |
-| 5 | `LOGGING/V_PENDING_FILES.sql` | View — manifest rows not yet `SUCCESS` |
-| 6 | `LOGGING/V_TABLE_ROW_COUNTS.sql` | View — log vs table row cross-check |
-| 7 | `LOGGING/SP_INGEST_STAGED_FILES.sql` | Stored procedure — `COPY INTO` from stage |
+| 4 | `LOGGING/V_LATEST_INGEST_STATUS.sql` | Latest attempt per file |
+| 5 | `LOGGING/V_PENDING_FILES.sql` | Pending manifest rows |
+| 6 | `LOGGING/V_TABLE_ROW_COUNTS.sql` | Log vs staging table row counts |
+| 7 | `LOGGING/SP_INGEST_STAGED_FILES.sql` | `COPY INTO` from stage → `TRIPS_*` |
+| 8 | `STAGING_NYC/SP_LOAD_*.sql`, `STAGING_JC/SP_LOAD_*.sql` | Merge staging → `TRIPS_ALL` |
 
-Stages `RAW_INGESTION` must already exist in `STAGING_NYC` and `STAGING_JC` (created outside this repo or in your account setup).
+Stages `RAW_INGESTION` must exist in `STAGING_NYC` and `STAGING_JC`.
 
-## End-to-end ingest flow (Python + Snowflake)
+## End-to-end flow
 
 ```text
-compress_for_snowflake.py
+compress_for_snowflake.py → gzip_manifest.jsonl
         │
-        ▼
-gzip_staging/gzip_manifest.jsonl
-        │
-        ├─► stage_files.py
-        │         PUT → @STAGING_NYC|JC.RAW_INGESTION
-        │         log: snowflake_stage_loading_log.jsonl
-        │
-        ├─► ingest_stage_files.py
-        │         INSERT → LOGGING.STAGE_MANIFEST
-        │
-        └─► CALL LOGGING.SP_INGEST_STAGED_FILES('all')
-                  COPY INTO TRIPS_* (positional columns + metadata)
-                  log: LOGGING.INGEST_LOG
+        ├─► stage_files.py              → @STAGING_*/RAW_INGESTION
+        ├─► populate_stage_manifest.py  → LOGGING.STAGE_MANIFEST
+        └─► SP_INGEST_STAGED_FILES        → TRIPS_MODERN | TRIPS_LEGACY_V1 | V2
+                    │
+                    └─► SP_LOAD_TRIPS_ALL → TRIPS_ALL (unified)
 ```
 
-### Python (from repo root)
+### Python
 
 ```bash
 python stage_files.py --workers 4
-python ingest_stage_files.py
+python populate_stage_manifest.py
 ```
 
-### Snowflake
+### Snowflake — ingest from stage
 
 ```sql
 CALL CITIBIKE_SYSTEM_DATA.LOGGING.SP_INGEST_STAGED_FILES('all');
--- or 'nyc' | 'jersey_city'
 ```
+
+### Snowflake — merge into TRIPS_ALL
+
+```sql
+-- NYC
+CALL CITIBIKE_SYSTEM_DATA.STAGING_NYC.SP_LOAD_TRIPS_ALL();
+-- or individually:
+CALL CITIBIKE_SYSTEM_DATA.STAGING_NYC.SP_LOAD_TRIPS_MODERN();
+CALL CITIBIKE_SYSTEM_DATA.STAGING_NYC.SP_LOAD_TRIPS_LEGACY_V1();
+CALL CITIBIKE_SYSTEM_DATA.STAGING_NYC.SP_LOAD_TRIPS_LEGACY_V2();
+
+-- Jersey City
+CALL CITIBIKE_SYSTEM_DATA.STAGING_JC.SP_LOAD_TRIPS_ALL();
+```
+
+Each `SP_LOAD_*` procedure is **idempotent**: rows already in `TRIPS_ALL` (same `_SOURCE_FILE` + `_SOURCE_ROW_NUMBER`) are skipped.
+
+## STAGING objects
+
+### Per-layout tables (from `SP_INGEST_STAGED_FILES`)
+
+| Table | Source layout |
+|-------|----------------|
+| `TRIPS_MODERN` | 13-col `ride_id` (2020+) |
+| `TRIPS_LEGACY_V1` | 15-col lowercase legacy |
+| `TRIPS_LEGACY_V2` | 15-col Title Case legacy |
+
+### TRIPS_ALL (unified)
+
+| File | Object |
+|------|--------|
+| `STAGING_NYC/TRIPS_ALL.sql` | `STAGING_NYC.TRIPS_ALL` |
+| `STAGING_JC/TRIPS_ALL.sql` | `STAGING_JC.TRIPS_ALL` |
+
+Normalized columns: `RIDE_ID`, `STARTED_AT`/`ENDED_AT`, `TRIP_DURATION`, stations, lat/lng, `MEMBER_CASUAL`, legacy `BIKEID`/`BIRTH_YEAR`/`GENDER`, plus `_SOURCE_*` and `_LOADED_AT_TBL`.
+
+### Merge procedures
+
+| Procedure | Source → target |
+|-----------|-----------------|
+| `SP_LOAD_TRIPS_MODERN` | `TRIPS_MODERN` → `TRIPS_ALL` |
+| `SP_LOAD_TRIPS_LEGACY_V1` | `TRIPS_LEGACY_V1` → `TRIPS_ALL` |
+| `SP_LOAD_TRIPS_LEGACY_V2` | `TRIPS_LEGACY_V2` → `TRIPS_ALL` |
+| `SP_LOAD_TRIPS_ALL` | Calls all three above |
 
 ## LOGGING objects
 
-| Object | Role |
-|--------|------|
-| `STAGE_MANIFEST` | One row per `.csv.gz` part: output path, region, `schema_key`, target `SF_SCHEMA` / `SF_TABLE` |
-| `INGEST_LOG` | One row per COPY attempt (append-only history) |
-| `V_LATEST_INGEST_STATUS` | Latest `INGEST_LOG` row per `OUTPUT_FILE` |
-| `V_PENDING_FILES` | Manifest rows where latest status ≠ `SUCCESS` |
-| `V_TABLE_ROW_COUNTS` | Sum of `ROWS_LOADED` in log vs `COUNT(*)` on each staging table |
-| `SP_INGEST_STAGED_FILES` | Processes pending manifest rows; `PURGE=TRUE` on COPY |
-
-Full procedure design, column mappings, and troubleshooting: **`LOGGING/SP_INGEST_STAGED_FILES_DOC.txt`**.
+See **`LOGGING/SP_INGEST_STAGED_FILES_DOC.txt`** for full ingest procedure documentation.
 
 ## TEST queries (`TEST/`)
 
-Run these in a worksheet after the stored procedure (they query `LOGGING` views/tables):
-
 | File | Use |
 |------|-----|
-| `RUN_STATUS_OVERVIEW.sql` | Counts by `STATUS`, region, table |
-| `FILES_STILL_PENDING.sql` | `SELECT * FROM V_PENDING_FILES` |
-| `FAILED_FILES.sql` | Latest failed files and error messages |
-| `PARTIAL_LOADS.sql` | Files with `ERRORS_SEEN > 0` |
-| `ROW_COUNT_CROSS_CHECK.sql` | `SELECT * FROM V_TABLE_ROW_COUNTS` |
+| `RUN_STATUS_OVERVIEW.sql` | Ingest counts by status |
+| `FILES_STILL_PENDING.sql` | `V_PENDING_FILES` |
+| `FAILED_FILES.sql` | Latest failures |
+| `PARTIAL_LOADS.sql` | Success with errors |
+| `ROW_COUNT_CROSS_CHECK.sql` | Log vs table counts |
 
-## `schema_key` → table mapping
+## `schema_key` → staging table
 
-Must match `snowflake_config.py` / `ingest_stage_files.py`:
+| `schema_key` | Table |
+|--------------|-------|
+| `dc497b4333c4` | `TRIPS_MODERN` |
+| `473144999085` | `TRIPS_LEGACY_V1` |
+| `e24ee8457e0e` | `TRIPS_LEGACY_V2` |
 
-| `schema_key` | Table | CSV layout |
-|--------------|-------|------------|
-| `dc497b4333c4` | `TRIPS_MODERN` | 13-column modern (`ride_id`, …) |
-| `473144999085` | `TRIPS_LEGACY_V1` | 15-column lowercase legacy |
-| `e24ee8457e0e` | `TRIPS_LEGACY_V2` | 15-column Title Case legacy |
-
-Same table names in both `STAGING_NYC` and `STAGING_JC`; region comes from manifest `region`.
-
-## Stage file naming
-
-`stage_files.py` uploads using the **basename** only (e.g. `nyc_dc497b4333c4_part0028.csv.gz`).  
-`SP_INGEST_STAGED_FILES` copies from `@<schema>.RAW_INGESTION/<basename>`.  
-`LIST @...RAW_INGESTION` may show names prefixed with `raw_ingestion/` — that is normal for internal stages.
+Must match `snowflake_config.py` / `populate_stage_manifest.py`.

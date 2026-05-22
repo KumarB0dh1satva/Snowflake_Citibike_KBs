@@ -1,0 +1,71 @@
+-- -----------------------------------------------------------
+-- SP_LOAD_TRIPS_MODERN
+-- Merge TRIPS_MODERN → TRIPS_ALL (Jersey City). Idempotent on source file + row.
+-- -----------------------------------------------------------
+
+CREATE OR REPLACE PROCEDURE CITIBIKE_SYSTEM_DATA.STAGING_JC.SP_LOAD_TRIPS_MODERN()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    rows_inserted INTEGER DEFAULT 0;
+BEGIN
+    INSERT INTO CITIBIKE_SYSTEM_DATA.STAGING_JC.TRIPS_ALL (
+        RIDE_ID,
+        RIDEABLE_TYPE,
+        BIKEID,
+        STARTED_AT,
+        ENDED_AT,
+        TRIP_DURATION,
+        START_STATION_NAME,
+        START_STATION_ID,
+        END_STATION_NAME,
+        END_STATION_ID,
+        START_LAT,
+        START_LNG,
+        END_LAT,
+        END_LNG,
+        MEMBER_CASUAL,
+        BIRTH_YEAR,
+        GENDER,
+        _SOURCE_FILE,
+        _SOURCE_ROW_NUMBER,
+        _LOADED_AT,
+        _LOADED_AT_TBL
+    )
+    SELECT
+        SRC.RIDE_ID,
+        SRC.RIDEABLE_TYPE,
+        NULL::INT AS BIKEID,
+        SRC.STARTED_AT,
+        SRC.ENDED_AT,
+        TIMEDIFF('second', SRC.STARTED_AT, SRC.ENDED_AT) AS TRIP_DURATION,
+        SRC.START_STATION_NAME,
+        SRC.START_STATION_ID,
+        SRC.END_STATION_NAME,
+        SRC.END_STATION_ID,
+        SRC.START_LAT,
+        SRC.START_LNG,
+        SRC.END_LAT,
+        SRC.END_LNG,
+        SRC.MEMBER_CASUAL,
+        NULL::INT AS BIRTH_YEAR,
+        NULL::TINYINT AS GENDER,
+        SRC._SOURCE_FILE,
+        SRC._SOURCE_ROW_NUMBER,
+        SRC._LOADED_AT,
+        CURRENT_TIMESTAMP() AS _LOADED_AT_TBL
+    FROM CITIBIKE_SYSTEM_DATA.STAGING_JC.TRIPS_MODERN SRC
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM CITIBIKE_SYSTEM_DATA.STAGING_JC.TRIPS_ALL TGT
+        WHERE TGT._SOURCE_FILE = SRC._SOURCE_FILE
+          AND TGT._SOURCE_ROW_NUMBER = SRC._SOURCE_ROW_NUMBER
+    );
+
+    rows_inserted := SQLROWCOUNT;
+    RETURN 'SP_LOAD_TRIPS_MODERN (JC): inserted ' || rows_inserted || ' rows into TRIPS_ALL';
+END;
+$$;
