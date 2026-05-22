@@ -2,7 +2,7 @@
 
 Python pipeline to discover, download, and extract Citi Bike trip data from the public [Citi Bike system data](https://citibikenyc.com/system-data) S3 bucket (`https://s3.amazonaws.com/tripdata/`), compress it for staging, load it into Snowflake, and build an integration-layer star schema for analysis.
 
-**Recommended Snowflake path:** `stage_files.py` → `populate_stage_manifest.py` → `SP_INGEST_STAGED_FILES` → `SP_LOAD_TRIPS_ALL` → `INT_UDM_*` build procedures. See [docs/SNOWFLAKE_INGEST.md](docs/SNOWFLAKE_INGEST.md), [docs/SNOWFLAKE_INTEGRATION.md](docs/SNOWFLAKE_INTEGRATION.md), and [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md).
+**End-to-end Snowflake path:** `stage_files.py` → `populate_stage_manifest.py` → `SP_INGEST_STAGED_FILES` → `SP_LOAD_TRIPS_ALL` → `INT_UDM_*` build procedures → **`RPT_*` reporting views**. See [docs/SNOWFLAKE_INGEST.md](docs/SNOWFLAKE_INGEST.md), [docs/SNOWFLAKE_INTEGRATION.md](docs/SNOWFLAKE_INTEGRATION.md), [docs/SNOWFLAKE_REPORTING.md](docs/SNOWFLAKE_REPORTING.md), and [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md).
 
 ## Prerequisites
 
@@ -11,7 +11,8 @@ Python pipeline to discover, download, and extract Citi Bike trip data from the 
 - Snowflake database `CITIBIKE_SYSTEM_DATA` with:
   - Schemas `STAGING_NYC`, `STAGING_JC` (tables + `RAW_INGESTION` stages)
   - Schema `LOGGING` (manifest, ingest log, stored procedure)
-  - Schemas `INT_UDM_NYC`, `INT_UDM_JC` (dimensions + `FACT_RIDE`, build procedures) — deploy from `Snowflake_Scripts/`
+  - Schemas `INT_UDM_NYC`, `INT_UDM_JC` (dimensions + `FACT_RIDE`, build procedures)
+  - Schemas `RPT_NYC`, `RPT_JC` (reporting views on the integration layer) — deploy from `Snowflake_Scripts/`
 
 ## Setup
 
@@ -36,6 +37,7 @@ Non-secret routing (regions, tables, stage name, parallelism) lives in `snowflak
            │       3. SP_INGEST_STAGED_FILES     → STAGING_*.TRIPS_*
            │       4. SP_LOAD_TRIPS_ALL          → STAGING_*.TRIPS_ALL
            │       5. SP_BUILD_DIM_* / FACT    → INT_UDM_*.DIM_* + FACT_RIDE
+           │       6. RPT_* views              → RPT_NYC / RPT_JC (analytics)
            │       Monitor: LOGGING.INGEST_LOG + Snowflake_Scripts/TEST/
            │
            └─► [Alternative] load_to_snowflake.py
@@ -50,6 +52,7 @@ Non-secret routing (regions, tables, stage name, parallelism) lives in `snowflak
 | COPY into staging tables | `LOGGING.SP_INGEST_STAGED_FILES` | `LOGGING.INGEST_LOG` |
 | Merge to unified table | `STAGING_*.SP_LOAD_TRIPS_ALL` | `TRIPS_ALL` (per region) |
 | Integration star schema | `INT_UDM_*.SP_BUILD_*` (SQL) | `DIM_DATES`, `DIM_STATION`, `FACT_RIDE` |
+| Reporting views | `RPT_NYC/*`, `RPT_JC/*` (SQL views) | `RPT_RIDERSHIP_OVER_TIME`, `RPT_TOP_STATIONS`, `RPT_TOP_ROUTES` |
 | All-in-one (alt.) | `load_to_snowflake.py` | `snowflake_ingest_log.jsonl` |
 
 Deploy SQL in order: [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md). Procedure details: [Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt](Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt).
@@ -79,6 +82,7 @@ Deploy SQL in order: [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md).
 | `STAGING_NYC/`, `STAGING_JC/` | Staging tables (`TRIPS_*`), unified `TRIPS_ALL`, `SP_LOAD_*` merge procedures |
 | `LOGGING/` | `STAGE_MANIFEST`, `INGEST_LOG`, views, `SP_INGEST_STAGED_FILES.sql`, full doc `.txt` |
 | `INT_UDM_NYC/`, `INT_UDM_JC/` | Integration layer: `DIM_DATES`, `DIM_STATION`, `FACT_RIDE`, `SP_BUILD_*` procedures |
+| `RPT_NYC/`, `RPT_JC/` | Reporting views: ridership trends, top stations, top routes |
 | `TEST/` | Operator queries: pending files, failures, row-count cross-check |
 
 ### Documentation
@@ -87,7 +91,8 @@ Deploy SQL in order: [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md).
 |-----|----------|
 | [docs/SNOWFLAKE_INGEST.md](docs/SNOWFLAKE_INGEST.md) | Staged ingest runbook, monitoring, troubleshooting |
 | [docs/SNOWFLAKE_INTEGRATION.md](docs/SNOWFLAKE_INTEGRATION.md) | Integration layer runbook (`INT_UDM_*` build procedures) |
-| [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md) | SQL deploy order and object index (staging, logging, integration) |
+| [docs/SNOWFLAKE_REPORTING.md](docs/SNOWFLAKE_REPORTING.md) | Reporting layer runbook (`RPT_*` views) |
+| [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md) | SQL deploy order and object index (full stack) |
 
 ### Routing (`snowflake_config.py`)
 
@@ -120,7 +125,7 @@ Outputs: `downloads/`, `extracted/`, `gzip_staging/`, `gzip_manifest.jsonl`.
 
 **6a. One-time Snowflake deploy**
 
-Run scripts listed in [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md): staging tables → `TRIPS_ALL` → LOGGING → `SP_INGEST_STAGED_FILES` → `SP_LOAD_*` → `INT_UDM_*` DDL and `SP_BUILD_*` procedures.
+Run scripts listed in [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md): staging → `TRIPS_ALL` → LOGGING → ingest SP → `SP_LOAD_*` → `INT_UDM_*` → **`RPT_*` views** (final layer).
 
 **6b. Upload gzip files to stage**
 
@@ -188,6 +193,21 @@ SELECT COUNT(*) FROM CITIBIKE_SYSTEM_DATA.INT_UDM_JC.FACT_RIDE;
 ```
 
 Runbook and re-run guidance: [docs/SNOWFLAKE_INTEGRATION.md](docs/SNOWFLAKE_INTEGRATION.md). `SP_BUILD_FACT_RIDE_*` is idempotent on source file + row number; pass `TRUE` to truncate and full-reload the fact table.
+
+**6g. Deploy reporting views (final layer)**
+
+After `FACT_RIDE` is populated, deploy views from `Snowflake_Scripts/RPT_NYC/` and `RPT_JC/` (schemas + three views per region). No procedures — views query the integration layer directly.
+
+```sql
+-- Deploy all RPT_*.sql scripts, then query:
+SELECT * FROM CITIBIKE_SYSTEM_DATA.RPT_NYC.RPT_RIDERSHIP_OVER_TIME LIMIT 100;
+SELECT * FROM CITIBIKE_SYSTEM_DATA.RPT_NYC.RPT_TOP_STATIONS LIMIT 50;
+SELECT * FROM CITIBIKE_SYSTEM_DATA.RPT_NYC.RPT_TOP_ROUTES LIMIT 50;
+
+SELECT * FROM CITIBIKE_SYSTEM_DATA.RPT_JC.RPT_TOP_STATIONS LIMIT 20;
+```
+
+Details: [docs/SNOWFLAKE_REPORTING.md](docs/SNOWFLAKE_REPORTING.md). Re-run integration builds only when facts change; redeploy views only when SQL definitions change.
 
 ### 6 (alternative). `load_to_snowflake.py`
 

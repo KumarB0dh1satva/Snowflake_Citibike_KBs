@@ -100,3 +100,7 @@ GROUP BY 1 ORDER BY 1;
 ## Object reference
 
 See [Snowflake_Scripts/README.md](../Snowflake_Scripts/README.md#int_udm-objects-integration-layer) for the full file and procedure index.
+
+## Next step: reporting layer
+
+After `FACT_RIDE` is built, deploy and query `RPT_NYC` / `RPT_JC` views — see [SNOWFLAKE_REPORTING.md](SNOWFLAKE_REPORTING.md).

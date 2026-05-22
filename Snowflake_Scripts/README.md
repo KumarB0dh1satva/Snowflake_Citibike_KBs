@@ -11,6 +11,8 @@ All objects live in database **`CITIBIKE_SYSTEM_DATA`**.
 | `LOGGING` | `STAGE_MANIFEST`, `INGEST_LOG`, views, `SP_INGEST_STAGED_FILES` |
 | `INT_UDM_NYC` | NYC integration layer — `DIM_DATES`, `DIM_STATION`, `FACT_RIDE`, build procedures |
 | `INT_UDM_JC` | Jersey City integration layer — same star schema, region-specific station/fact builds |
+| `RPT_NYC` | NYC reporting views on `INT_UDM_NYC` (ridership, stations, routes) |
+| `RPT_JC` | Jersey City reporting views on `INT_UDM_JC` |
 | `TEST/` | Operator SQL files (run in a worksheet) |
 
 ## Recommended deploy order
@@ -34,10 +36,15 @@ All objects live in database **`CITIBIKE_SYSTEM_DATA`**.
 | 14 | `INT_UDM_NYC/SP_BUILD_DIM_DATES.sql` | Date spine 2013–2030 + holiday flags; syncs to JC |
 | 15 | `INT_UDM_NYC/SP_BUILD_DIM_STATION_NYC.sql`, `INT_UDM_JC/SP_BUILD_DIM_STATION_JC.sql` | Stations from `TRIPS_ALL` |
 | 16 | `INT_UDM_NYC/SP_BUILD_FACT_RIDE_NYC.sql`, `INT_UDM_JC/SP_BUILD_FACT_RIDE_JC.sql` | Rides from `TRIPS_ALL` with dimension FKs |
+| 17 | `RPT_NYC/RPT_NYC.sql`, `RPT_JC/RPT_JC.sql` | Reporting schemas |
+| 18–20 | `RPT_NYC/RPT_*.sql` | NYC views: ridership, stations, routes |
+| 21–23 | `RPT_JC/RPT_*.sql` | JC views: same three reports |
 
 Stages `RAW_INGESTION` must exist in `STAGING_NYC` and `STAGING_JC`.
 
 **Integration layer prerequisites:** `STAGING_*`.`TRIPS_ALL` populated (steps 1–8). Run `SP_BUILD_DIM_DATES` before fact builds so `START_DATE_SK` / `END_DATE_SK` resolve. Run `SP_BUILD_DIM_STATION_*` before `SP_BUILD_FACT_RIDE_*` so station SKs resolve.
+
+**Reporting layer prerequisites:** `INT_UDM_*`.`FACT_RIDE` populated (step 16). Deploy `RPT_*` views last (steps 17–23). Views are read-only; no stored procedures.
 
 ## End-to-end flow
 
@@ -51,6 +58,8 @@ compress_for_snowflake.py → gzip_manifest.jsonl
                     └─► SP_LOAD_TRIPS_ALL → TRIPS_ALL (unified)
                               │
                               └─► INT_UDM_* (dimensions + FACT_RIDE)
+                                        │
+                                        └─► RPT_* views (reporting)
 ```
 
 ### Integration layer (after `TRIPS_ALL`)
@@ -68,6 +77,17 @@ CALL CITIBIKE_SYSTEM_DATA.INT_UDM_NYC.SP_BUILD_FACT_RIDE_NYC(FALSE);  -- increme
 CALL CITIBIKE_SYSTEM_DATA.INT_UDM_JC.SP_BUILD_DIM_STATION_JC();
 CALL CITIBIKE_SYSTEM_DATA.INT_UDM_JC.SP_BUILD_FACT_RIDE_JC(FALSE);
 ```
+
+### Reporting layer (after `FACT_RIDE`)
+
+Deploy `RPT_NYC/*.sql` and `RPT_JC/*.sql`, then query:
+
+```sql
+SELECT COUNT(*) FROM CITIBIKE_SYSTEM_DATA.RPT_NYC.RPT_RIDERSHIP_OVER_TIME;
+SELECT COUNT(*) FROM CITIBIKE_SYSTEM_DATA.RPT_JC.RPT_TOP_ROUTES;
+```
+
+Full runbook: [../docs/SNOWFLAKE_REPORTING.md](../docs/SNOWFLAKE_REPORTING.md).
 
 ### Python
 
@@ -204,3 +224,35 @@ Station resolution uses **station name** as the master key (IDs differ between l
 | `INT_UDM_JC/FACT_RIDE.sql` | Table DDL |
 | `INT_UDM_JC/SP_BUILD_DIM_STATION_JC.sql` | Procedure |
 | `INT_UDM_JC/SP_BUILD_FACT_RIDE_JC.sql` | Procedure |
+
+## RPT objects (reporting layer)
+
+Analyst-facing views on the integration star schema. **No build procedures** — deploy views after `FACT_RIDE` has data.
+
+### Schemas
+
+| File | Object |
+|------|--------|
+| `RPT_NYC/RPT_NYC.sql` | `RPT_NYC` |
+| `RPT_JC/RPT_JC.sql` | `RPT_JC` |
+
+### Views (per region)
+
+| View | Business question | Grain |
+|------|-------------------|-------|
+| `RPT_RIDERSHIP_OVER_TIME` | How has ridership grown? MoM / YoY by member vs casual | Month × `MEMBER_CASUAL` |
+| `RPT_TOP_STATIONS` | Which stations are busiest? Departures, arrivals, net flow | One row per station |
+| `RPT_TOP_ROUTES` | Most popular origin–destination pairs | One row per start/end station pair |
+
+Sources: `INT_UDM_<region>.FACT_RIDE`, `DIM_STATION`, `DIM_DATES`.
+
+### File index (`RPT_*`)
+
+| File | Creates |
+|------|---------|
+| `RPT_NYC/RPT_RIDERSHIP_OVER_TIME.sql` | View |
+| `RPT_NYC/RPT_TOP_STATIONS.sql` | View |
+| `RPT_NYC/RPT_TOP_ROUTES.sql` | View |
+| `RPT_JC/RPT_RIDERSHIP_OVER_TIME.sql` | View |
+| `RPT_JC/RPT_TOP_STATIONS.sql` | View |
+| `RPT_JC/RPT_TOP_ROUTES.sql` | View |
