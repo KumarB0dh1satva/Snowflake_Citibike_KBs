@@ -1,8 +1,8 @@
 # Citibike S3 to Snowflake Pipeline
 
-Python pipeline to discover, download, and extract Citi Bike trip data from the public S3 bucket (`https://s3.amazonaws.com/tripdata/`), compress it for staging, and load it into Snowflake.
+Python pipeline to discover, download, and extract Citi Bike trip data from the public [Citi Bike system data](https://citibikenyc.com/system-data) S3 bucket (`https://s3.amazonaws.com/tripdata/`), compress it for staging, load it into Snowflake, and build an integration-layer star schema for analysis.
 
-**Recommended Snowflake path:** `stage_files.py` → `populate_stage_manifest.py` → `SP_INGEST_STAGED_FILES` → `SP_LOAD_TRIPS_ALL` into unified `TRIPS_ALL`. See [docs/SNOWFLAKE_INGEST.md](docs/SNOWFLAKE_INGEST.md) and [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md).
+**Recommended Snowflake path:** `stage_files.py` → `populate_stage_manifest.py` → `SP_INGEST_STAGED_FILES` → `SP_LOAD_TRIPS_ALL` → `INT_UDM_*` build procedures. See [docs/SNOWFLAKE_INGEST.md](docs/SNOWFLAKE_INGEST.md), [docs/SNOWFLAKE_INTEGRATION.md](docs/SNOWFLAKE_INTEGRATION.md), and [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md).
 
 ## Prerequisites
 
@@ -10,7 +10,8 @@ Python pipeline to discover, download, and extract Citi Bike trip data from the 
 - Enough local disk for raw zips and extracted CSVs (tens of GB for a full historical run)
 - Snowflake database `CITIBIKE_SYSTEM_DATA` with:
   - Schemas `STAGING_NYC`, `STAGING_JC` (tables + `RAW_INGESTION` stages)
-  - Schema `LOGGING` (manifest, ingest log, stored procedure) — deploy from `Snowflake_Scripts/`
+  - Schema `LOGGING` (manifest, ingest log, stored procedure)
+  - Schemas `INT_UDM_NYC`, `INT_UDM_JC` (dimensions + `FACT_RIDE`, build procedures) — deploy from `Snowflake_Scripts/`
 
 ## Setup
 
@@ -34,6 +35,7 @@ Non-secret routing (regions, tables, stage name, parallelism) lives in `snowflak
            │       2. populate_stage_manifest.py → LOGGING.STAGE_MANIFEST
            │       3. SP_INGEST_STAGED_FILES     → STAGING_*.TRIPS_*
            │       4. SP_LOAD_TRIPS_ALL          → STAGING_*.TRIPS_ALL
+           │       5. SP_BUILD_DIM_* / FACT    → INT_UDM_*.DIM_* + FACT_RIDE
            │       Monitor: LOGGING.INGEST_LOG + Snowflake_Scripts/TEST/
            │
            └─► [Alternative] load_to_snowflake.py
@@ -47,6 +49,7 @@ Non-secret routing (regions, tables, stage name, parallelism) lives in `snowflak
 | Register work queue | `populate_stage_manifest.py` | `LOGGING.STAGE_MANIFEST` |
 | COPY into staging tables | `LOGGING.SP_INGEST_STAGED_FILES` | `LOGGING.INGEST_LOG` |
 | Merge to unified table | `STAGING_*.SP_LOAD_TRIPS_ALL` | `TRIPS_ALL` (per region) |
+| Integration star schema | `INT_UDM_*.SP_BUILD_*` (SQL) | `DIM_DATES`, `DIM_STATION`, `FACT_RIDE` |
 | All-in-one (alt.) | `load_to_snowflake.py` | `snowflake_ingest_log.jsonl` |
 
 Deploy SQL in order: [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md). Procedure details: [Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt](Snowflake_Scripts/LOGGING/SP_INGEST_STAGED_FILES_DOC.txt).
@@ -75,6 +78,7 @@ Deploy SQL in order: [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md).
 |--------|----------|
 | `STAGING_NYC/`, `STAGING_JC/` | Staging tables (`TRIPS_*`), unified `TRIPS_ALL`, `SP_LOAD_*` merge procedures |
 | `LOGGING/` | `STAGE_MANIFEST`, `INGEST_LOG`, views, `SP_INGEST_STAGED_FILES.sql`, full doc `.txt` |
+| `INT_UDM_NYC/`, `INT_UDM_JC/` | Integration layer: `DIM_DATES`, `DIM_STATION`, `FACT_RIDE`, `SP_BUILD_*` procedures |
 | `TEST/` | Operator queries: pending files, failures, row-count cross-check |
 
 ### Documentation
@@ -82,7 +86,8 @@ Deploy SQL in order: [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md).
 | Doc | Contents |
 |-----|----------|
 | [docs/SNOWFLAKE_INGEST.md](docs/SNOWFLAKE_INGEST.md) | Staged ingest runbook, monitoring, troubleshooting |
-| [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md) | SQL deploy order and object index |
+| [docs/SNOWFLAKE_INTEGRATION.md](docs/SNOWFLAKE_INTEGRATION.md) | Integration layer runbook (`INT_UDM_*` build procedures) |
+| [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md) | SQL deploy order and object index (staging, logging, integration) |
 
 ### Routing (`snowflake_config.py`)
 
@@ -115,7 +120,7 @@ Outputs: `downloads/`, `extracted/`, `gzip_staging/`, `gzip_manifest.jsonl`.
 
 **6a. One-time Snowflake deploy**
 
-Run scripts listed in [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md): staging tables → `TRIPS_ALL` → LOGGING → `SP_INGEST_STAGED_FILES` → `SP_LOAD_*` procedures.
+Run scripts listed in [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md): staging tables → `TRIPS_ALL` → LOGGING → `SP_INGEST_STAGED_FILES` → `SP_LOAD_*` → `INT_UDM_*` DDL and `SP_BUILD_*` procedures.
 
 **6b. Upload gzip files to stage**
 
@@ -166,6 +171,24 @@ SELECT COUNT(*) FROM CITIBIKE_SYSTEM_DATA.STAGING_JC.TRIPS_ALL;
 
 `SP_LOAD_TRIPS_*` procedures dedupe on `_SOURCE_FILE` + `_SOURCE_ROW_NUMBER`. Safe to re-run after new data lands in `TRIPS_MODERN` / `TRIPS_LEGACY_*`.
 
+**6f. Build integration layer (Snowflake SQL)**
+
+Deploy `INT_UDM_*` DDL and procedures per [Snowflake_Scripts/README.md](Snowflake_Scripts/README.md) (steps 9–16). Processing is **stored procedures only** (no Python script in this repo).
+
+```sql
+CALL CITIBIKE_SYSTEM_DATA.INT_UDM_NYC.SP_BUILD_DIM_DATES();
+CALL CITIBIKE_SYSTEM_DATA.INT_UDM_NYC.SP_BUILD_DIM_STATION_NYC();
+CALL CITIBIKE_SYSTEM_DATA.INT_UDM_NYC.SP_BUILD_FACT_RIDE_NYC(FALSE);
+
+CALL CITIBIKE_SYSTEM_DATA.INT_UDM_JC.SP_BUILD_DIM_STATION_JC();
+CALL CITIBIKE_SYSTEM_DATA.INT_UDM_JC.SP_BUILD_FACT_RIDE_JC(FALSE);
+
+SELECT COUNT(*) FROM CITIBIKE_SYSTEM_DATA.INT_UDM_NYC.FACT_RIDE;
+SELECT COUNT(*) FROM CITIBIKE_SYSTEM_DATA.INT_UDM_JC.FACT_RIDE;
+```
+
+Runbook and re-run guidance: [docs/SNOWFLAKE_INTEGRATION.md](docs/SNOWFLAKE_INTEGRATION.md). `SP_BUILD_FACT_RIDE_*` is idempotent on source file + row number; pass `TRUE` to truncate and full-reload the fact table.
+
 ### 6 (alternative). `load_to_snowflake.py`
 
 Single-script PUT + COPY; does not use `LOGGING` or the stored procedure:
@@ -189,7 +212,7 @@ Use `analysis_output/schema_signatures.csv` with `Snowflake_Scripts/` when chang
 
 ## License / data
 
-Trip data is provided by Citi Bike / NYC Open Data via the public S3 bucket. Check their terms of use for your project.
+Trip data is provided by Citi Bike via the public S3 bucket and [system data page](https://citibikenyc.com/system-data). Check their data use policy for your project.
 
 ## Author
 
