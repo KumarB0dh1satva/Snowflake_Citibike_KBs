@@ -17,8 +17,12 @@ AS
 $$
 DECLARE
     rows_inserted INTEGER DEFAULT 0;
+    V_START_DATE  DATE;
+    V_END_DATE    DATE;
 BEGIN
- 
+    -- Bind parameters to local variables so they resolve inside SQL statements
+    V_START_DATE := P_START_DATE;
+    V_END_DATE := P_END_DATE;
     -- ------------------------------------------------------------
     -- Clear and rebuild (idempotent)
     -- ------------------------------------------------------------
@@ -138,9 +142,9 @@ BEGIN
     INSERT INTO CITIBIKE_SYSTEM_DATA.INT_UDM_NYC.DIM_DATES
     WITH DATE_SPINE AS (
         SELECT
-            DATEADD(DAY, SEQ4(), P_START_DATE) AS FULL_DATE
+            DATEADD(DAY, SEQ4(), :V_START_DATE) AS FULL_DATE
         FROM TABLE(GENERATOR(ROWCOUNT => 6575))  -- covers ~18 years
-        WHERE DATEADD(DAY, SEQ4(), P_START_DATE) <= P_END_DATE
+        WHERE DATEADD(DAY, SEQ4(), :V_START_DATE) <= :V_END_DATE
     )
     SELECT
         TO_NUMBER(TO_CHAR(FULL_DATE, 'YYYYMMDD'))           AS DATE_SK,

@@ -32,38 +32,41 @@ BEGIN
         _CREATED_AT,
         _UPDATED_AT
     )
-    WITH
-
     -- --------------------------------------------------------
     -- Collect all station name + id + coordinate observations
     -- from both start and end sides of every trip
     -- --------------------------------------------------------
-    ALL_OBSERVATIONS AS (
+    WITH ALL_OBSERVATIONS AS (
         SELECT
-            TRIM(UPPER(START_STATION_NAME))     AS STATION_NAME,
-            START_STATION_ID                    AS STATION_ID,
-            START_LAT                           AS LAT,
-            START_LNG                           AS LNG,
-            SOURCE_SCHEMA
+            TRIM(UPPER(START_STATION_NAME)) AS STATION_NAME,
+            START_STATION_ID AS STATION_ID,
+            START_LAT AS LAT,
+            START_LNG AS LNG,
+            CASE
+                WHEN SPLIT_PART(_SOURCE_FILE, '_', 2) = 'dc497b4333c4' THEN 'MODERN'
+                WHEN SPLIT_PART(_SOURCE_FILE, '_', 2) = '473144999085' THEN 'LEGACY_V1'
+                ELSE 'LEGACY_V2'
+            END AS SOURCE_SCHEMA,
         FROM CITIBIKE_SYSTEM_DATA.STAGING_NYC.TRIPS_ALL
         WHERE START_STATION_NAME IS NOT NULL
           AND START_LAT BETWEEN 40.0 AND 42.0
           AND START_LNG BETWEEN -75.0 AND -72.0
-
         UNION ALL
-
         SELECT
             TRIM(UPPER(END_STATION_NAME)),
             END_STATION_ID,
             END_LAT,
             END_LNG,
-            SOURCE_SCHEMA
+            CASE
+                WHEN SPLIT_PART(_SOURCE_FILE, '_', 2) = 'dc497b4333c4' THEN 'MODERN'
+                WHEN SPLIT_PART(_SOURCE_FILE, '_', 2) = '473144999085' THEN 'LEGACY_V1'
+                ELSE 'LEGACY_V2'
+            END AS SOURCE_SCHEMA,
         FROM CITIBIKE_SYSTEM_DATA.STAGING_NYC.TRIPS_ALL
         WHERE END_STATION_NAME IS NOT NULL
           AND END_LAT BETWEEN 40.0 AND 42.0
           AND END_LNG BETWEEN -75.0 AND -72.0
     ),
-
     -- --------------------------------------------------------
     -- Separate legacy vs modern IDs per station name
     -- --------------------------------------------------------
@@ -73,14 +76,12 @@ BEGIN
         WHERE SOURCE_SCHEMA IN ('LEGACY_V1', 'LEGACY_V2')
         GROUP BY STATION_NAME
     ),
-
     MODERN_IDS AS (
         SELECT STATION_NAME, MAX(STATION_ID) AS MODERN_STATION_ID
         FROM ALL_OBSERVATIONS
         WHERE SOURCE_SCHEMA = 'MODERN'
         GROUP BY STATION_NAME
     ),
-
     -- --------------------------------------------------------
     -- Aggregate coordinates and stats per station name
     -- --------------------------------------------------------

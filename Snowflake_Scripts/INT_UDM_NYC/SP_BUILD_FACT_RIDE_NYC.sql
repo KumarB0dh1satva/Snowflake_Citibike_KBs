@@ -68,7 +68,7 @@ BEGIN
         LOWER(TRIM(SRC.RIDEABLE_TYPE))                      AS RIDEABLE_TYPE,
         SRC.BIKEID,
  
-        LOWER(TRIM(SRC.MEMBER_CASUAL))                      AS MEMBER_CASUAL,
+        COALESCE(LOWER(TRIM(SRC.MEMBER_CASUAL)), 'unknown')  AS MEMBER_CASUAL,
         SRC.BIRTH_YEAR,
         SRC.GENDER,
  
@@ -82,20 +82,23 @@ BEGIN
  
         -- Age bucket
         CASE
-            WHEN SRC.BIRTH_YEAR IS NULL                         THEN NULL
+            WHEN SRC.BIRTH_YEAR IS NULL THEN NULL
             WHEN YEAR(SRC.STARTED_AT) - SRC.BIRTH_YEAR < 18    THEN '<18'
             WHEN YEAR(SRC.STARTED_AT) - SRC.BIRTH_YEAR < 25    THEN '18-24'
             WHEN YEAR(SRC.STARTED_AT) - SRC.BIRTH_YEAR < 35    THEN '25-34'
             WHEN YEAR(SRC.STARTED_AT) - SRC.BIRTH_YEAR < 45    THEN '35-44'
             WHEN YEAR(SRC.STARTED_AT) - SRC.BIRTH_YEAR < 55    THEN '45-54'
             WHEN YEAR(SRC.STARTED_AT) - SRC.BIRTH_YEAR < 65    THEN '55-64'
-            ELSE                                                     '65+'
-        END                                                 AS AGE_BUCKET,
- 
-        SRC.SOURCE_SCHEMA,
+            ELSE '65+'
+        END AS AGE_BUCKET,
+        CASE
+            WHEN SPLIT_PART(SRC._SOURCE_FILE, '_', 2) = 'dc497b4333c4' THEN 'MODERN'
+            WHEN SPLIT_PART(SRC._SOURCE_FILE, '_', 2) = '473144999085' THEN 'LEGACY_V1'
+            ELSE 'LEGACY_V2'
+        END AS SOURCE_SCHEMA,
         SRC._SOURCE_FILE,
         SRC._SOURCE_ROW_NUMBER,
-        CURRENT_TIMESTAMP()                                 AS _LOADED_AT
+        CURRENT_TIMESTAMP() AS _LOADED_AT
  
     FROM CITIBIKE_SYSTEM_DATA.STAGING_NYC.TRIPS_ALL SRC
  
